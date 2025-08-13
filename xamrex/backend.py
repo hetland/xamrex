@@ -20,6 +20,7 @@ from xarray.backends.common import (
 from xarray.core.variable import Variable
 
 from .AMReX_array import AMReXDatasetMeta, AMReXFabsMetaSingleLevel
+from .refinement import create_refinement_handler
 
 
 class AMReXLazyArray(BackendArray):
@@ -37,30 +38,11 @@ class AMReXLazyArray(BackendArray):
         self.fab_meta = fab_meta
         self.field_idx = meta.field_list.index(field_name)
         
-        # Calculate grid dimensions for this level
-        # FIXED: Apply refinement only to x and y dimensions, not z
-        base_refinement = int(self.meta.ref_factors[0])
-        base_dims = self.meta.domain_dimensions[:self.meta.dimensionality]
+        # Use the new RefinementHandler for all refinement calculations
+        self.refinement_handler = create_refinement_handler(meta)
         
-        # Create refinement factors array: apply refinement to x,y but not z
-        if self.meta.dimensionality == 3:
-            # For 3D: x,y get refinement, z stays the same
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level, 1])
-            refined_dims = base_dims * refinement_factors
-            spatial_dims = tuple(refined_dims[::-1])  # Reverse to z,y,x for Fortran order
-            self.full_dims = (1,) + spatial_dims  # Add time dimension
-        else:
-            # For 2D: x,y get refinement
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level])
-            refined_dims = base_dims * refinement_factors
-            spatial_dims = tuple(refined_dims)
-            self.full_dims = (1,) + spatial_dims  # Add time dimension
-        
-        # Store refinement factors for coordinate calculation
-        self.refinement_factors = refinement_factors
-        
-        # Set BackendArray properties
-        self.shape = self.full_dims
+        # Get array shape using the refinement handler
+        self.shape = self.refinement_handler.get_full_shape(level, include_time=True)
         self.dtype = np.float64
         
         # Create a dask array that will actually load data when accessed
@@ -244,35 +226,17 @@ class AMReXSingleLevelStore(AbstractDataStore):
         """Return variables for all fields at this level."""
         variables = {}
         
-        # FIXED: Calculate per-dimension refinement factors
-        # Apply refinement only to x and y dimensions, not z
-        base_dims = self.meta.domain_dimensions[:self.meta.dimensionality]
-        base_refinement = self.meta.ref_factors[0] if len(self.meta.ref_factors) > 0 else 2
+        # Use RefinementHandler for coordinate calculations
+        refinement_handler = create_refinement_handler(self.meta)
         
-        # Create refinement factors array: x,y get refinement, z stays at 1
-        if self.meta.dimensionality == 3:
-            # For 3D: x,y get refinement, z stays the same
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level, 1])
-        else:
-            # For 2D: x,y get refinement
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level])
-        
-        full_dims = base_dims * refinement_factors
-        
-        # FIXED ISSUE 1: Read time dimension name from the data instead of hardcoding 'ocean_time'
-        # For now, we'll default to 'ocean_time' but this should be configurable
+        # Get time dimension name
         time_dim_name = getattr(self.meta, 'time_dimension_name', 'ocean_time')
         
         # Create dimension names with the configurable time dimension
         if self.meta.dimensionality == 3:
             dim_names = [time_dim_name, 'z', 'y', 'x']  # Add time dimension
-            coord_indices = [2, 1, 0]    # Map to original x,y,z indices (time is singleton)
         else:
             dim_names = [time_dim_name, 'y', 'x']       # Add time dimension for 2D
-            coord_indices = [1, 0]       # Map to original x,y indices
-            
-        domain_extent = self.meta.domain_right_edge - self.meta.domain_left_edge
-        base_grid_spacing = domain_extent / base_dims  # Base level spacing
         
         # Create time coordinate (singleton dimension)
         variables[time_dim_name] = Variable(
@@ -284,37 +248,39 @@ class AMReXSingleLevelStore(AbstractDataStore):
             }
         )
         
-        # Create spatial coordinates (skip time dimension)
-        spatial_dims = dim_names[1:]  # Skip time dimension
-        for i, dim in enumerate(spatial_dims):
-            # Get the corresponding original coordinate index
-            orig_idx = coord_indices[i]
-            coord_start = self.meta.domain_left_edge[orig_idx]
+        # Generate spatial coordinates using RefinementHandler
+        coord_arrays = refinement_handler.get_coordinate_arrays(
+            self.level, self.meta.domain_left_edge, self.meta.domain_right_edge
+        )
+        
+        # Create spatial coordinate variables
+        refinement_factors = refinement_handler.get_refinement_factors(self.level)
+        for dim_name, coord_array in coord_arrays.items():
+            dim_idx = ['x', 'y', 'z'].index(dim_name)
+            refinement_factor = refinement_factors[dim_idx]
             
-            # FIXED: Apply refinement factor to spacing calculation
-            # For refined levels, dx and dy should be divided by refinement factor
-            base_spacing = float(base_grid_spacing[orig_idx])
-            refinement_factor_for_dim = refinement_factors[orig_idx]
-            spacing = base_spacing / refinement_factor_for_dim
+            # Calculate spacing info
+            if len(coord_array) > 1:
+                spacing = coord_array[1] - coord_array[0]
+            else:
+                spacing = 0.0
             
-            n_points = full_dims[orig_idx]
+            base_spacing = spacing * refinement_factor
             
-            # Cell-centered coordinates
-            coord_array = coord_start + (np.arange(n_points) + 0.5) * spacing
-            
-            variables[dim] = Variable(
-                dims=(dim,),
+            variables[dim_name] = Variable(
+                dims=(dim_name,),
                 data=coord_array,
                 attrs={
-                    'long_name': f'{dim.upper()} coordinate',
+                    'long_name': f'{dim_name.upper()} coordinate',
                     'units': 'unknown',  # TODO: extract from AMReX if available
-                    'spacing': spacing,
-                    'base_spacing': base_spacing,
-                    'refinement_factor': int(refinement_factor_for_dim),
+                    'spacing': float(spacing),
+                    'base_spacing': float(base_spacing),
+                    'refinement_factor': int(refinement_factor),
                 }
             )
         
         # Create data variables for each field
+        base_refinement = refinement_handler.base_refinement
         for field in self.meta.field_list:
             # Create lazy array wrapper
             lazy_array = AMReXLazyArray(

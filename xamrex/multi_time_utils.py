@@ -1,6 +1,6 @@
 """
 Utilities for working with multi-time AMReX datasets.
-Provides functions to open and concatenate multiple time steps following xarray conventions.
+Provides convenient functions that wrap the unified backend.
 """
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -14,7 +14,9 @@ def open_amrex_time_series(plotfile_paths: Union[List[Union[str, Path]], str],
                           dimension_names: dict = None,
                           **kwargs) -> xr.Dataset:
     """
-    Open multiple AMReX plotfiles as a time series dataset following xarray conventions.
+    Open multiple AMReX plotfiles as a time series dataset.
+    
+    This is a convenience wrapper around xr.open_dataset() with the amrex engine.
     
     Parameters
     ----------
@@ -27,7 +29,7 @@ def open_amrex_time_series(plotfile_paths: Union[List[Union[str, Path]], str],
     dimension_names : dict, optional
         Custom dimension names
     **kwargs
-        Additional arguments passed to the backend
+        Additional arguments passed to xr.open_dataset
         
     Returns
     -------
@@ -37,32 +39,16 @@ def open_amrex_time_series(plotfile_paths: Union[List[Union[str, Path]], str],
     # Handle glob patterns
     if isinstance(plotfile_paths, str):
         if '*' in plotfile_paths or '?' in plotfile_paths:
-            # It's a glob pattern
             plotfile_paths = sorted(glob.glob(plotfile_paths))
             if not plotfile_paths:
                 raise ValueError(f"No files found matching pattern")
         else:
-            # Single file path
             plotfile_paths = [plotfile_paths]
     
-    # Convert to Path objects and validate
-    validated_paths = []
-    for path in plotfile_paths:
-        path_obj = Path(path)
-        if not path_obj.exists():
-            raise FileNotFoundError(f"Plotfile not found: {path}")
-        if not path_obj.is_dir():
-            raise ValueError(f"Plotfile path must be a directory: {path}")
-        validated_paths.append(path_obj)
-    
-    if len(validated_paths) == 0:
-        raise ValueError("No valid plotfile paths provided")
-    
-    # Use the unified backend directly
-    from .backend import AMReXEntrypoint
-    backend = AMReXEntrypoint()
-    return backend.open_dataset(
-        validated_paths,
+    # Use xarray's open_dataset with amrex engine (unified backend handles the rest)
+    return xr.open_dataset(
+        plotfile_paths,
+        engine='amrex',
         level=level,
         time_dimension_name=time_dimension_name,
         dimension_names=dimension_names,

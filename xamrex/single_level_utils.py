@@ -229,57 +229,6 @@ def find_overlapping_region(datasets: Dict[int, xr.Dataset]) -> Dict[str, slice]
     return overlapping_region
 
 
-def calculate_effective_resolution(datasets: Dict[int, xr.Dataset], 
-                                 field: str) -> xr.Dataset:
-    """
-    Calculate effective resolution by combining information from all levels.
-    Returns a dataset showing the finest available resolution at each point.
-    
-    Parameters
-    ----------
-    datasets : dict
-        Dictionary of level -> dataset from open_amrex_levels
-    field : str
-        Field name to analyze
-        
-    Returns
-    -------
-    xarray.Dataset
-        Dataset with effective resolution information
-    """
-    # Use finest level as base grid
-    finest_level = max(datasets.keys())
-    base_ds = datasets[finest_level]
-    
-    if field not in base_ds.data_vars:
-        raise ValueError(f"Field {field} not found in finest level dataset")
-    
-    # Create resolution map (refinement level at each point)
-    resolution_map = xr.full_like(base_ds[field], fill_value=-1, dtype=int)
-    
-    # Fill in resolution levels, starting from coarsest
-    for level in sorted(datasets.keys()):
-        ds = datasets[level]
-        if field in ds.data_vars:
-            var = ds[field]
-            
-            # Find where this level has valid data
-            if hasattr(var.values, 'mask'):
-                valid_mask = ~var.values.mask
-            else:
-                valid_mask = ~np.isnan(var.values)
-            
-            # Map to finest grid coordinates
-            # This is a simplified version - full implementation would need
-            # proper coordinate transformation and interpolation
-            if level == finest_level:
-                resolution_map = resolution_map.where(~valid_mask, level)
-            # TODO: Add coordinate mapping for other levels
-    
-    return xr.Dataset({
-        f'{field}_effective_level': resolution_map,
-        f'{field}_data': base_ds[field]
-    })
 
 
 def create_level_summary(datasets: Dict[int, xr.Dataset]) -> xr.Dataset:
