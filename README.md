@@ -1,20 +1,10 @@
-# xamrex: Unified AMReX Backend for xarray
+# xamrex: AMReX Backend for xarray
 
-A comprehensive xarray backend for reading AMReX plotfiles with native support for time series concatenation and multi-level AMR data.
+An xarray backend for reading AMReX plotfiles with native support for time series concatenation and multi-level AMR data.
 
 ## Overview
 
-xamrex provides a unified interface for working with AMReX simulation data in Python, seamlessly integrating with the xarray ecosystem. The package supports both single plotfiles and multi-time series datasets, with intelligent handling of adaptive mesh refinement (AMR) levels.
-
-## Key Features
-
-- **Unified xarray Backend**: Single `amrex` engine handles all use cases automatically
-- **Multi-Time Series Support**: Load and concatenate time series following xarray conventions
-- **Multi-Level AMR**: Access any refinement level with automatic NaN filling for missing levels
-- **Flexible Input Types**: Single files, file lists, or directories with pattern matching
-- **Lazy Loading**: Efficient memory usage with dask-backed arrays
-- **Automatic Sorting**: Time series automatically sorted by simulation time
-- **Compatibility Validation**: Ensures consistent domains and fields across time steps
+`xamrex` registers the `amrex` backend to xarray for working with AMReX simulation data in Python. The package supports both single plotfiles and multi-time series datasets, with intelligent handling of adaptive mesh refinement (AMR) levels. Efficient memory usage is achived with dask-backed arrays for lazy loading and large datasets.
 
 ## Installation
 
@@ -52,13 +42,6 @@ ds = xr.open_dataset(plotfiles, engine='amrex', level=0)
 
 # Method 2: Directory auto-discovery
 ds = xr.open_dataset('simulation_output/', engine='amrex', level=0, pattern='plt_*')
-
-# Method 3: Using utility functions
-import xamrex
-ds = xamrex.open_amrex_time_series(plotfiles, level=0)
-
-print(f"Time series shape: {ds.dims}")
-print(f"Time range: {ds.ocean_time.min().item()} to {ds.ocean_time.max().item()}")
 ```
 
 ### Multi-Level AMR
@@ -70,12 +53,11 @@ ds_level1 = xr.open_dataset(plotfiles, engine='amrex', level=1)  # Refined level
 
 print(f"Level 0: {dict(ds_level0.sizes)}")  
 print(f"Level 1: {dict(ds_level1.sizes)}")  # Higher resolution in x,y
-
-# Missing levels automatically filled with NaN
-# No errors if some time steps don't have the requested level
 ```
+Missing levels automatically filled with NaN. Time steps that don't have the requested level are filled completely.
+TODO: Flag levels that never exist within the dataset.
 
-## Comprehensive API
+## xamrex utility functions
 
 ### 1. Unified xarray Backend
 
@@ -189,41 +171,6 @@ subset = large_ds.isel(ocean_time=slice(0, 10))  # Lazy slicing
 computed = subset.compute()  # Load only subset into memory
 ```
 
-## Data Structure
-
-### Single Time Step
-
-```python
-<xarray.Dataset>
-Dimensions:  (ocean_time: 1, z: 16, y: 15, x: 42)
-Coordinates:
-  * ocean_time  (ocean_time) float64 0.0
-  * z           (z) float64 0.03125 0.09375 ... 0.96875
-  * y           (y) float64 0.03125 0.09375 ... 0.96875  
-  * x           (x) float64 0.03125 0.09375 ... 0.96875
-Data variables:
-    temp         (ocean_time, z, y, x) float64 dask.array<chunksize=(1, 16, 15, 42)>
-    salt         (ocean_time, z, y, x) float64 dask.array<chunksize=(1, 16, 15, 42)>
-```
-
-### Time Series
-
-```python
-<xarray.Dataset>
-Dimensions:  (ocean_time: 5, z: 16, y: 15, x: 42)
-Coordinates:
-  * ocean_time  (ocean_time) float64 0.0 1000.0 2000.0 3000.0 4000.0
-  * z           (z) float64 0.03125 0.09375 ... 0.96875
-  * y           (y) float64 0.03125 0.09375 ... 0.96875
-  * x           (x) float64 0.03125 0.09375 ... 0.96875
-Data variables:
-    temp         (ocean_time, z, y, x) float64 dask.array<chunksize=(1, 16, 15, 42)>
-    salt         (ocean_time, z, y, x) float64 dask.array<chunksize=(1, 16, 15, 42)>
-Attributes:
-    concatenated_files: 5
-    time_range: 0.0 to 4000.0
-    level: 0
-```
 
 ## Multi-Level AMR Support
 
@@ -296,19 +243,6 @@ else:
     print(f"Available fields: {validation['fields']}")
 ```
 
-## Migration from Version 0.4.x
-
-The new API is fully backward compatible:
-
-```python
-# Old way (still works)
-ds = xr.open_dataset("plt_00000", engine='amrex', level=0)
-
-# New capabilities (no changes needed for single files)
-ds = xr.open_dataset(["plt_00000", "plt_01000"], engine='amrex', level=0)  # Now works!
-ds = xr.open_dataset("simulation_data/", engine='amrex', level=0)          # Now works!
-```
-
 ## Requirements
 
 - Python >= 3.8
@@ -339,9 +273,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-TBD
-
-## Version History
-
-- **v0.5.0**: Multi-time series support, unified backend, multi-level AMR
-- **v0.4.x**: Single-file AMReX backend with lazy loading
