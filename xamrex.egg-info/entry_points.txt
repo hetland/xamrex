@@ -1,0 +1,2 @@
+[xarray.backends]
+amrex = xamrex.backend:AMReXEntrypoint
