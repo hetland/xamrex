@@ -10,36 +10,25 @@ class RefinementHandler:
     """
     Handles AMReX refinement calculations and coordinate transformations.
     
-    Centralizes the complex logic around:
-    - Refinement factor calculations
-    - Coordinate generation for different levels
-    - Dimension-specific refinement (x,y refined, z not refined)
+    Now uses actual header data instead of mathematical estimates.
     """
     
-    def __init__(self, base_refinement: int, dimensionality: int, domain_dimensions: np.ndarray):
+    def __init__(self, meta):
         """
-        Initialize refinement handler.
+        Initialize refinement handler with metadata.
         
         Parameters
         ----------
-        base_refinement : int
-            Base refinement factor (typically 2)
-        dimensionality : int
-            Spatial dimensionality (2 or 3)
-        domain_dimensions : np.ndarray
-            Base level domain dimensions
+        meta : AMReXDatasetMeta
+            Metadata object containing parsed header information
         """
-        self.base_refinement = base_refinement
-        self.dimensionality = dimensionality
-        self.domain_dimensions = domain_dimensions
+        self.meta = meta
+        self.base_refinement = int(meta.ref_factors[0]) if len(meta.ref_factors) > 0 else 2
+        self.dimensionality = meta.dimensionality
     
     def get_refinement_factors(self, level: int) -> np.ndarray:
         """
-        Get refinement factors for a specific level.
-        
-        In AMReX convention:
-        - x,y dimensions are refined by base_refinement^level
-        - z dimension is not refined (factor = 1)
+        Get refinement factors for a specific level from header data.
         
         Parameters
         ----------
@@ -51,23 +40,11 @@ class RefinementHandler:
         np.ndarray
             Refinement factors for each dimension
         """
-        if self.dimensionality == 3:
-            # x,y get refinement, z stays at 1
-            return np.array([
-                self.base_refinement ** level,  # x
-                self.base_refinement ** level,  # y  
-                1                               # z
-            ])
-        else:
-            # 2D: x,y get refinement
-            return np.array([
-                self.base_refinement ** level,  # x
-                self.base_refinement ** level   # y
-            ])
+        return np.array(self.meta.get_level_refinement_factors(level))
     
     def get_refined_dimensions(self, level: int) -> np.ndarray:
         """
-        Get grid dimensions for a specific level.
+        Get grid dimensions for a specific level from header data.
         
         Parameters
         ----------
@@ -79,9 +56,9 @@ class RefinementHandler:
         np.ndarray
             Grid dimensions for this level
         """
-        refinement_factors = self.get_refinement_factors(level)
-        base_dims = self.domain_dimensions[:self.dimensionality]
-        return base_dims * refinement_factors
+
+        print(np.array(self.meta.get_level_dimensions(level)))
+        return np.array(self.meta.get_level_dimensions(level))
     
     def get_full_shape(self, level: int, include_time: bool = True) -> Tuple[int, ...]:
         """
@@ -106,7 +83,7 @@ class RefinementHandler:
             spatial_shape = tuple(refined_dims[::-1])
         else:
             # 2D: y, x
-            spatial_shape = tuple(refined_dims)
+            spatial_shape = tuple(refined_dims[::-1])
         
         if include_time:
             return (1,) + spatial_shape
@@ -116,7 +93,7 @@ class RefinementHandler:
     def get_coordinate_arrays(self, level: int, domain_left_edge: np.ndarray, 
                             domain_right_edge: np.ndarray) -> dict:
         """
-        Generate coordinate arrays for a specific level.
+        Generate coordinate arrays for a specific level using header data.
         
         Parameters
         ----------
@@ -132,31 +109,8 @@ class RefinementHandler:
         dict
             Dictionary of coordinate arrays {dim_name: coord_array}
         """
-        refinement_factors = self.get_refinement_factors(level)
-        refined_dims = self.get_refined_dimensions(level)
-        
-        domain_extent = domain_right_edge - domain_left_edge
-        base_dims = self.domain_dimensions[:self.dimensionality]
-        base_grid_spacing = domain_extent / base_dims
-        
-        coords = {}
-        dim_names = ['x', 'y', 'z'][:self.dimensionality]
-        
-        for i, dim in enumerate(dim_names):
-            coord_start = domain_left_edge[i]
-            
-            # Calculate spacing for this level and dimension
-            base_spacing = float(base_grid_spacing[i])
-            refinement_factor_for_dim = refinement_factors[i]
-            spacing = base_spacing / refinement_factor_for_dim
-            
-            n_points = refined_dims[i]
-            
-            # Cell-centered coordinates
-            coord_array = coord_start + (np.arange(n_points) + 0.5) * spacing
-            coords[dim] = coord_array
-        
-        return coords
+        # Use the metadata method directly
+        return self.meta.get_level_coordinate_arrays(level)
     
     def validate_fab_indices(self, level: int, lo_indices: np.ndarray, 
                            hi_indices: np.ndarray) -> bool:
@@ -211,20 +165,7 @@ class RefinementHandler:
             Slices for placing FAB data in global grid
         """
         if self.dimensionality == 3:
-            # Handle potential z-refinement mismatch
-            if level > 0:
-                refinement_factor = self.base_refinement ** level
-                
-                # Check if z indices indicate refinement in the FAB data
-                if hi_k > self.domain_dimensions[2]:
-                    # FAB data is refined in z, map back to unrefined z coordinates
-                    lo_k_unrefined = lo_k // refinement_factor
-                    hi_k_unrefined = hi_k // refinement_factor
-                    return (slice(lo_k_unrefined, hi_k_unrefined),
-                           slice(lo_j, hi_j),
-                           slice(lo_i, hi_i))
-            
-            # Normal case: (z, y, x) in Fortran order
+            # Direct mapping: (z, y, x) in Fortran order
             return (slice(lo_k, hi_k), slice(lo_j, hi_j), slice(lo_i, hi_i))
         else:
             # 2D case: (y, x)
@@ -245,9 +186,4 @@ def create_refinement_handler(meta) -> RefinementHandler:
     RefinementHandler
         Configured refinement handler
     """
-    base_refinement = int(meta.ref_factors[0]) if len(meta.ref_factors) > 0 else 2
-    return RefinementHandler(
-        base_refinement=base_refinement,
-        dimensionality=meta.dimensionality,
-        domain_dimensions=meta.domain_dimensions
-    )
+    return RefinementHandler(meta)

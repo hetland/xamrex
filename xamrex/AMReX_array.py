@@ -101,16 +101,157 @@ class AMReXDatasetMeta():
                 self.refine_by = ref_factors[0]
                 self.level_offsets = [0 for l in range(self.max_level + 1)]
             
-            # Global index space
+            # Global index space - parse dimensions for all levels
             index_space = header_file.readline()
-            # Format: ((0,0,0) (255,255,255) (0,0,0)) ((0,0,0) (511,511,511) (0,0,0))
-            root_space = index_space.replace("(", "").replace(")", "").split()[:2]
-            start = np.array(root_space[0].split(","), dtype="int64")
-            stop = np.array(root_space[1].split(","), dtype="int64")
-            dd = np.ones(3, dtype="int64")
-            dd[:self.dimensionality] = stop - start + 1
-            self.domain_offset[:self.dimensionality] = start  # Level 0 offset
-            self.domain_dimensions = dd  # Level 0 dimensions
+            # Format: ((0,0,0) (19,59,31) (0,0,0)) ((0,0,0) (59,179,31) (0,0,0)) ((0,0,0) (539,1619,31) (0,0,0))
+            self.level_dimensions = self._parse_all_level_dimensions(index_space)
+            self.level_refinement_factors = self._calculate_level_refinement_factors()
+            
+            # Keep backward compatibility
+            self.domain_dimensions = np.array(self.level_dimensions[0], dtype="int64")
+            self.domain_offset[:self.dimensionality] = np.zeros(self.dimensionality, dtype="int64")  # Level 0 offset
+    
+    def _parse_all_level_dimensions(self, index_space_line):
+        """
+        Parse dimensions for all levels from the index space line.
+        
+        Example input: "((0,0,0) (19,59,31) (0,0,0)) ((0,0,0) (59,179,31) (0,0,0)) ((0,0,0) (539,1619,31) (0,0,0))"
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping level to dimensions: {0: [20,60,32], 1: [60,180,32], 2: [540,1620,32]}
+        """
+        import re
+        
+        # Extract all level tuples - looking for middle coordinates in each level group
+        pattern = r'\(\([^)]+\) \(([^)]+)\) \([^)]+\)\)'
+        matches = re.findall(pattern, index_space_line.strip())
+        
+        if not matches:
+            raise ValueError(f"Could not parse index space line: {index_space_line}")
+        
+        level_dimensions = {}
+        for level, match in enumerate(matches):
+            coords = match.split(',')
+            if len(coords) != 3:
+                raise ValueError(f"Expected 3 coordinates, got {len(coords)}: {coords}")
+            
+            # Convert from last valid index to dimension count
+            dims = [int(coord.strip()) + 1 for coord in coords]
+            
+            # Only store dimensions up to the dataset dimensionality
+            level_dimensions[level] = dims[:self.dimensionality]
+        
+        return level_dimensions
+    
+    def _calculate_level_refinement_factors(self):
+        """
+        Calculate actual refinement factors for each level based on parsed dimensions.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping level to refinement factors: {0: [1,1,1], 1: [3,3,1], 2: [27,27,1]}
+        """
+        if not hasattr(self, 'level_dimensions') or not self.level_dimensions:
+            raise ValueError("Level dimensions must be parsed first")
+        
+        level_0_dims = np.array(self.level_dimensions[0], dtype=float)
+        level_refinement_factors = {}
+        
+        for level, dims in self.level_dimensions.items():
+            current_dims = np.array(dims, dtype=float)
+            
+            # Calculate refinement factors as ratio to level 0
+            refinement_factors = current_dims / level_0_dims
+            
+            # Extend to 3D if needed for compatibility
+            if len(refinement_factors) < 3:
+                full_factors = np.ones(3)
+                full_factors[:len(refinement_factors)] = refinement_factors
+                refinement_factors = full_factors
+            
+            level_refinement_factors[level] = refinement_factors.tolist()
+        
+        return level_refinement_factors
+    
+    def get_level_dimensions(self, level):
+        """
+        Get the grid dimensions for a specific level.
+        
+        Parameters
+        ----------
+        level : int
+            AMR level
+            
+        Returns
+        -------
+        list
+            Grid dimensions [nx, ny, nz] for this level
+        """
+        if level not in self.level_dimensions:
+            raise ValueError(f"Level {level} not found. Available levels: {list(self.level_dimensions.keys())}")
+        return self.level_dimensions[level].copy()
+    
+    def get_level_refinement_factors(self, level):
+        """
+        Get the refinement factors for a specific level.
+        
+        Parameters
+        ----------
+        level : int
+            AMR level
+            
+        Returns
+        -------
+        list
+            Refinement factors [rx, ry, rz] for this level relative to level 0
+        """
+        if level not in self.level_refinement_factors:
+            raise ValueError(f"Level {level} not found. Available levels: {list(self.level_refinement_factors.keys())}")
+        return self.level_refinement_factors[level].copy()
+    
+    def get_level_coordinate_arrays(self, level):
+        """
+        Generate coordinate arrays for a specific level using actual dimensions.
+        
+        Parameters
+        ----------
+        level : int
+            AMR level
+            
+        Returns
+        -------
+        dict
+            Dictionary of coordinate arrays {dim_name: coord_array}
+        """
+        level_dims = self.get_level_dimensions(level)
+        refinement_factors = self.get_level_refinement_factors(level)
+        
+        # Calculate domain extent and base grid spacing
+        domain_extent = self.domain_right_edge - self.domain_left_edge
+        level_0_dims = np.array(self.level_dimensions[0])
+        base_grid_spacing = domain_extent / level_0_dims
+        
+        coords = {}
+        dim_names = ['x', 'y', 'z'][:self.dimensionality]
+        
+        for i, dim in enumerate(dim_names):
+            coord_start = self.domain_left_edge[i]
+            
+            # Calculate spacing for this level and dimension
+            base_spacing = float(base_grid_spacing[i])
+            refinement_factor_for_dim = refinement_factors[i]
+            spacing = base_spacing / refinement_factor_for_dim
+            
+            n_points = level_dims[i]
+            
+            # Cell-centered coordinates
+            coord_array = coord_start + (np.arange(n_points) + 0.5) * spacing
+            coords[dim] = coord_array
+        
+        return coords
 
 
 class AMReXFabsMetaSingleLevel():

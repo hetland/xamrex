@@ -90,31 +90,9 @@ class AMReXLazyArray(BackendArray):
             lo_i, lo_j, lo_k = fab_row['lo_i'], fab_row['lo_j'], fab_row['lo_k']
             hi_i, hi_j, hi_k = fab_row['hi_i'], fab_row['hi_j'], fab_row['hi_k']
             
-            # FIXED: Handle z-dimension refinement mismatch
-            # If the FAB data has been refined in z but we want to keep z unrefined,
-            # we need to subsample or map the data appropriately
-            if self.meta.dimensionality == 3 and self.level > 0:
-                base_refinement = int(self.meta.ref_factors[0])
-                refinement_factor = base_refinement ** self.level
-                
-                # Check if z indices indicate refinement in the FAB data
-                if hi_k > self.meta.domain_dimensions[2]:
-                    # FAB data is refined in z, but we want unrefined z coordinates
-                    # Map refined z indices back to unrefined z indices
-                    lo_k_unrefined = lo_k // refinement_factor
-                    hi_k_unrefined = hi_k // refinement_factor
-                    
-                    # Subsample the fab_data in the z dimension to match unrefined coordinates
-                    # Take every refinement_factor-th slice in the z dimension
-                    fab_data_subsampled = fab_data[::refinement_factor, :, :]
-                    
-                    # Place in the unrefined coordinate space
-                    full_data[0, lo_k_unrefined:hi_k_unrefined, lo_j:hi_j, lo_i:hi_i] = fab_data_subsampled
-                else:
-                    # Normal case: FAB data matches expected dimensions
-                    full_data[0, lo_k:hi_k, lo_j:hi_j, lo_i:hi_i] = fab_data
-            elif self.meta.dimensionality == 3:
-                # Level 0: direct mapping
+            # Direct mapping using actual FAB indices
+            if self.meta.dimensionality == 3:
+                # 3D case: (time, z, y, x)
                 full_data[0, lo_k:hi_k, lo_j:hi_j, lo_i:hi_i] = fab_data
             else:
                 # 2D case: (time, y, x)
@@ -302,21 +280,11 @@ class AMReXSingleLevelStore(AbstractDataStore):
         return variables
     
     def get_dimensions(self):
-        """Return dimensions for this level."""
-        base_dims = self.meta.domain_dimensions[:self.meta.dimensionality]
-        base_refinement = self.meta.ref_factors[0] if len(self.meta.ref_factors) > 0 else 2
+        """Return dimensions for this level using header data."""
+        # Use actual dimensions from header instead of calculations
+        level_dims = self.meta.get_level_dimensions(self.level)
         
-        # FIXED: Apply refinement only to x and y dimensions, not z
-        if self.meta.dimensionality == 3:
-            # For 3D: x,y get refinement, z stays the same
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level, 1])
-        else:
-            # For 2D: x,y get refinement
-            refinement_factors = np.array([base_refinement ** self.level, base_refinement ** self.level])
-        
-        full_dims = base_dims * refinement_factors
-        
-        # FIXED: Use Fortran order dimension names to match data
+        # Use Fortran order dimension names to match data layout
         if self.meta.dimensionality == 3:
             dim_names = ['z', 'y', 'x']  # Fortran order for 3D
             coord_indices = [2, 1, 0]    # Map to original x,y,z indices
@@ -324,7 +292,7 @@ class AMReXSingleLevelStore(AbstractDataStore):
             dim_names = ['y', 'x']       # Fortran order for 2D  
             coord_indices = [1, 0]       # Map to original x,y indices
             
-        return {dim: full_dims[coord_indices[i]] for i, dim in enumerate(dim_names)}
+        return {dim: level_dims[coord_indices[i]] for i, dim in enumerate(dim_names)}
     
     def get_attrs(self):
         """Return global attributes."""
@@ -620,6 +588,7 @@ class AMReXEntrypoint(BackendEntrypoint):
         coords = {}
         data_vars = {}
         
+        ### RDH -- this needs a refactor for generalization. Works for current REMORA plot files.
         # Get the time dimension name
         time_dim_name = time_dimension_name or 'ocean_time'
         
@@ -628,7 +597,8 @@ class AMReXEntrypoint(BackendEntrypoint):
                 coords[name] = var
             else:
                 data_vars[name] = var
-        
+        #### /RDH
+
         # Create dataset
         return xr.Dataset(
             data_vars=data_vars,
