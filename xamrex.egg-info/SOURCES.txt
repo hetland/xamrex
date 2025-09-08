@@ -1,3 +1,4 @@
+LICENSE.txt
 README.md
 setup.py
 tests/__init__.py
@@ -6,7 +7,10 @@ tests/test_xamrex.py
 xamrex/AMReX_array.py
 xamrex/__init__.py
 xamrex/backend.py
+xamrex/config.py
+xamrex/exceptions.py
 xamrex/multi_time_utils.py
+xamrex/refinement.py
 xamrex/single_level_utils.py
 xamrex.egg-info/PKG-INFO
 xamrex.egg-info/SOURCES.txt

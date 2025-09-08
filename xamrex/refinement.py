@@ -44,7 +44,7 @@ class RefinementHandler:
     
     def get_refined_dimensions(self, level: int) -> np.ndarray:
         """
-        Get grid dimensions for a specific level from header data.
+        Get whole grid dimensions for a specific refinement level from header data.
         
         Parameters
         ----------
@@ -57,7 +57,6 @@ class RefinementHandler:
             Grid dimensions for this level
         """
 
-        print(np.array(self.meta.get_level_dimensions(level)))
         return np.array(self.meta.get_level_dimensions(level))
     
     def get_full_shape(self, level: int, include_time: bool = True) -> Tuple[int, ...]:
@@ -111,65 +110,6 @@ class RefinementHandler:
         """
         # Use the metadata method directly
         return self.meta.get_level_coordinate_arrays(level)
-    
-    def validate_fab_indices(self, level: int, lo_indices: np.ndarray, 
-                           hi_indices: np.ndarray) -> bool:
-        """
-        Validate that FAB indices are within expected bounds for a level.
-        
-        Parameters
-        ----------
-        level : int
-            AMR level
-        lo_indices : np.ndarray
-            Low indices (i, j, k)
-        hi_indices : np.ndarray  
-            High indices (i, j, k)
-            
-        Returns
-        -------
-        bool
-            True if indices are valid
-        """
-        refined_dims = self.get_refined_dimensions(level)
-        
-        # Check bounds
-        if np.any(lo_indices < 0):
-            return False
-        
-        if np.any(hi_indices > refined_dims):
-            return False
-            
-        if np.any(lo_indices >= hi_indices):
-            return False
-            
-        return True
-    
-    def map_fab_to_global_indices(self, level: int, lo_i: int, lo_j: int, lo_k: int,
-                                 hi_i: int, hi_j: int, hi_k: int) -> Tuple[slice, ...]:
-        """
-        Map FAB indices to global grid indices for data placement.
-        
-        Parameters
-        ----------
-        level : int
-            AMR level
-        lo_i, lo_j, lo_k : int
-            FAB low indices
-        hi_i, hi_j, hi_k : int
-            FAB high indices
-            
-        Returns
-        -------
-        tuple of slice
-            Slices for placing FAB data in global grid
-        """
-        if self.dimensionality == 3:
-            # Direct mapping: (z, y, x) in Fortran order
-            return (slice(lo_k, hi_k), slice(lo_j, hi_j), slice(lo_i, hi_i))
-        else:
-            # 2D case: (y, x)
-            return (slice(lo_j, hi_j), slice(lo_i, hi_i))
 
 
 def create_refinement_handler(meta) -> RefinementHandler:

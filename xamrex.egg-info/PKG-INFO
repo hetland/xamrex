@@ -15,6 +15,7 @@ Classifier: Programming Language :: Python :: 3.11
 Classifier: Topic :: Scientific/Engineering
 Classifier: Topic :: Scientific/Engineering :: Physics
 Requires-Python: >=3.8
+License-File: LICENSE.txt
 Requires-Dist: xarray>=2023.1.0
 Requires-Dist: numpy>=1.20
 Requires-Dist: dask[array]>=2021.1
@@ -23,6 +24,7 @@ Dynamic: author
 Dynamic: classifier
 Dynamic: description
 Dynamic: home-page
+Dynamic: license-file
 Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary
