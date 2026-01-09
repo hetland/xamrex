@@ -1,221 +1,357 @@
 """
-Comprehensive test suite for xamrex package.
-Tests critical components including backend functionality, data loading, and utilities.
+Unit tests for xamrex package components.
 """
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
+import pytest
+from pathlib import Path
 import numpy as np
 import xarray as xr
-from pathlib import Path
 
-# Import xamrex components
-import xamrex
-from xamrex import AMReXSingleLevelEntrypoint
-from xamrex.AMReX_array import AMReXDatasetMeta, AMReXFabsMetaSingleLevel
+# Test data location
+TEST_DATA = Path(__file__).parent.parent / "ocean_out"
+PLOTFILE_0 = TEST_DATA / "plt00000"
+PLOTFILE_360 = TEST_DATA / "plt00360"
+ALL_PLOTFILES = sorted(TEST_DATA.glob("plt*"))
 
-class TestXamrex:
-    """Test suite for xamrex package."""
+# Skip tests if test data not available
+pytestmark = pytest.mark.skipif(
+    not TEST_DATA.exists(),
+    reason="Test data (ocean_out) not available"
+)
+
+
+class TestGridDetector:
+    """Test automatic grid type detection."""
     
-    def __init__(self):
-        """Set up test data paths."""
-        self.test_data_dir = Path(__file__).parent.parent / "test_data"
-        self.test_files = list(self.test_data_dir.glob("plt_ml_quad*"))
-        if not self.test_files:
-            raise FileNotFoundError(f"No test data found in {self.test_data_dir}")
-        self.test_file = self.test_files[0]  # Use first available test file
-    
-    def test_package_import(self):
-        """Test that xamrex package imports correctly."""
-        assert xamrex.__version__ is not None
-        assert hasattr(xamrex, 'AMReXSingleLevelEntrypoint')
-        assert hasattr(xamrex, 'open_amrex_levels')
-        print("✓ Package import test passed")
-    
-    def test_backend_entrypoint(self):
-        """Test AMReX backend entrypoint registration."""
-        backend = AMReXSingleLevelEntrypoint()
-        assert backend.guess_can_open(self.test_file)
-        print("✓ Backend entrypoint test passed")
-    
-    def test_xarray_backend_integration(self):
-        """Test xarray backend integration."""
-        # Test opening with xarray using the backend
-        ds = xr.open_dataset(self.test_file, engine='amrex', level=0)
+    def test_detect_grids_level_0(self):
+        """Test grid detection at level 0."""
+        from xamrex.grid_detector import GridDetector
         
-        # Verify dataset structure
-        assert isinstance(ds, xr.Dataset)
-        assert 'temp' in ds.data_vars or 'salt' in ds.data_vars  # Should have at least one field
-        assert 'x' in ds.coords
-        assert 'y' in ds.coords
+        detector = GridDetector()
+        grids = detector.detect_grids(PLOTFILE_0, level=0)
         
-        # Verify attributes
-        assert 'level' in ds.attrs
-        assert ds.attrs['level'] == 0
+        # Should find multiple grid types
+        assert len(grids) > 0
+        assert 'Cell' in grids or 'UFace' in grids
         
-        print("✓ xarray backend integration test passed")
+        # Check grid info structure
+        for dir_name, grid_info in grids.items():
+            assert 'grid_type' in grid_info
+            assert 'dimensionality' in grid_info
+            assert 'num_components' in grid_info
+            assert grid_info['grid_type'] in ['rho', 'u', 'v', 'w', 'psi']
     
-    def test_amrex_metadata_parsing(self):
-        """Test AMReX metadata parsing."""
-        meta = AMReXDatasetMeta(self.test_file)
+    def test_grid_type_mapping(self):
+        """Test grid type inference from directory names."""
+        from xamrex.grid_detector import GridDetector
         
-        # Verify metadata structure
+        detector = GridDetector()
+        
+        assert detector._infer_grid_type('Cell') == 'rho'
+        assert detector._infer_grid_type('UFace') == 'u'
+        assert detector._infer_grid_type('VFace') == 'v'
+        assert detector._infer_grid_type('WFace') == 'w'
+        assert detector._infer_grid_type('Nu_nd') == 'psi'
+        assert detector._infer_grid_type('rho2d') == 'rho'
+        assert detector._infer_grid_type('u2d') == 'u'
+
+
+class TestMetadata:
+    """Test metadata parsing."""
+    
+    def test_basic_meta_single_file(self):
+        """Test basic metadata from a single file."""
+        from xamrex.metadata import AMReXBasicMeta
+        
+        meta = AMReXBasicMeta(PLOTFILE_0)
+        
+        assert meta.n_fields > 0
+        assert len(meta.field_list) == meta.n_fields
         assert meta.dimensionality in [2, 3]
-        assert len(meta.field_list) > 0
         assert meta.max_level >= 0
-        assert meta.current_time >= 0
         assert len(meta.domain_left_edge) == meta.dimensionality
         assert len(meta.domain_right_edge) == meta.dimensionality
+    
+    def test_multi_grid_meta(self):
+        """Test multi-grid metadata across files."""
+        from xamrex.metadata import AMReXMultiGridMeta
         
-        print("✓ AMReX metadata parsing test passed")
+        meta = AMReXMultiGridMeta([PLOTFILE_0, PLOTFILE_360])
+        
+        assert len(meta.plotfile_paths) == 2
+        assert len(meta.time_values) == 2
+        assert meta.max_level_ever >= 0
+        assert len(meta.all_grids) > 0
+        assert len(meta.level_availability) > 0
+    
+    def test_level_availability_tracking(self):
+        """Test that level availability is tracked correctly."""
+        from xamrex.metadata import AMReXMultiGridMeta
+        
+        meta = AMReXMultiGridMeta(ALL_PLOTFILES)
+        
+        # Level 0 should always be available
+        assert 0 in meta.level_availability
+        assert len(meta.level_availability[0]) == len(ALL_PLOTFILES)
+        
+        # Check method
+        for level in meta.level_availability:
+            for time_idx in range(len(ALL_PLOTFILES)):
+                available = meta.is_level_available(level, time_idx)
+                assert isinstance(available, bool)
+
+
+class TestCoordinates:
+    """Test C-grid coordinate generation."""
+    
+    def test_coordinate_generation_rho(self):
+        """Test coordinate generation for rho-points."""
+        from xamrex.metadata import AMReXBasicMeta
+        from xamrex.coordinates import CGridCoordinateGenerator
+        
+        meta = AMReXBasicMeta(PLOTFILE_0)
+        coord_gen = CGridCoordinateGenerator(
+            meta.domain_left_edge,
+            meta.domain_right_edge,
+            meta.level_dimensions,
+            meta.dimensionality
+        )
+        
+        coords = coord_gen.generate_coordinates(0, 'rho', is_2d=False)
+        
+        assert 'x_rho' in coords
+        assert 'y_rho' in coords
+        if meta.dimensionality == 3:
+            assert 'z_rho' in coords
+        
+        # Check coordinate structure
+        for coord_name, (dim_name, array, attrs) in coords.items():
+            assert isinstance(array, np.ndarray)
+            assert 'axis' in attrs
+            assert 'c_grid_axis_shift' in attrs
+    
+    def test_staggered_coordinates(self):
+        """Test that u/v/w coordinates are properly staggered."""
+        from xamrex.metadata import AMReXBasicMeta
+        from xamrex.coordinates import CGridCoordinateGenerator
+        
+        meta = AMReXBasicMeta(PLOTFILE_0)
+        coord_gen = CGridCoordinateGenerator(
+            meta.domain_left_edge,
+            meta.domain_right_edge,
+            meta.level_dimensions,
+            meta.dimensionality
+        )
+        
+        # Get coordinates for different grids
+        rho_coords = coord_gen.generate_coordinates(0, 'rho', is_2d=False)
+        u_coords = coord_gen.generate_coordinates(0, 'u', is_2d=False)
+        
+        # U-points should be shifted in x
+        x_rho = rho_coords['x_rho'][1]
+        x_u = u_coords['x_u'][1]
+        
+        # U-points at cell faces, rho at centers
+        assert not np.allclose(x_rho, x_u)
+        
+        # Check shift attributes
+        assert rho_coords['x_rho'][2]['c_grid_axis_shift'] == 0.0
+        assert u_coords['x_u'][2]['c_grid_axis_shift'] == -0.5
+    
+    def test_dimension_names(self):
+        """Test dimension name generation."""
+        from xamrex.metadata import AMReXBasicMeta
+        from xamrex.coordinates import CGridCoordinateGenerator
+        
+        meta = AMReXBasicMeta(PLOTFILE_0)
+        coord_gen = CGridCoordinateGenerator(
+            meta.domain_left_edge,
+            meta.domain_right_edge,
+            meta.level_dimensions,
+            meta.dimensionality
+        )
+        
+        # 3D variable
+        dims_3d = coord_gen.get_dimension_names('rho', is_2d=False)
+        assert dims_3d[0] == 'ocean_time'
+        assert 'z_rho' in dims_3d
+        assert 'y_rho' in dims_3d
+        assert 'x_rho' in dims_3d
+        
+        # 2D variable
+        dims_2d = coord_gen.get_dimension_names('rho', is_2d=True)
+        assert len(dims_2d) == 3
+        assert dims_2d[0] == 'ocean_time'
+        assert 'z' not in str(dims_2d)
+
+
+class TestFABLoader:
+    """Test FAB data loading."""
     
     def test_fab_metadata_parsing(self):
         """Test FAB metadata parsing."""
-        meta = AMReXDatasetMeta(self.test_file)
-        fab_meta = AMReXFabsMetaSingleLevel(self.test_file, meta.n_fields, meta.dimensionality, level=0)
+        from xamrex.fab_loader import FABMetadata
+        from xamrex.grid_detector import GridDetector
         
-        # Verify FAB metadata structure
-        assert not fab_meta.metadata.empty
-        assert 'filename' in fab_meta.metadata.columns
-        assert 'byte_offset' in fab_meta.metadata.columns
+        detector = GridDetector()
+        grids = detector.detect_grids(PLOTFILE_0, level=0)
+        
+        # Get first grid
+        dir_name = list(grids.keys())[0]
+        grid_info = grids[dir_name]
+        
+        fab_meta = FABMetadata(
+            PLOTFILE_0, 0, dir_name,
+            grid_info['num_components'],
+            grid_info['dimensionality']
+        )
+        
+        assert fab_meta.nfabs > 0
+        assert len(fab_meta.metadata) == fab_meta.nfabs
         assert 'lo_i' in fab_meta.metadata.columns
         assert 'hi_i' in fab_meta.metadata.columns
-        
-        print("✓ FAB metadata parsing test passed")
     
-    def test_data_loading_lazy(self):
-        """Test lazy data loading."""
-        ds = xr.open_dataset(self.test_file, engine='amrex', level=0)
+    def test_masked_loader(self):
+        """Test masked FAB loader for missing data."""
+        from xamrex.fab_loader import MaskedFABLoader
         
-        # Get first data variable
-        var_name = list(ds.data_vars.keys())[0]
-        data_var = ds[var_name]
+        shape = (1, 10, 20, 30)
+        loader = MaskedFABLoader(shape)
+        dask_array = loader.create_dask_array()
         
-        # Verify lazy loading (data should be dask array)
-        assert hasattr(data_var.data, 'compute')  # Should be a dask array
+        assert dask_array.shape == shape
         
-        # Test actual data access
-        computed_data = data_var.compute()
-        assert isinstance(computed_data.data, np.ndarray)
-        assert computed_data.shape == data_var.shape
-        
-        print("✓ Lazy data loading test passed")
-    
-    def test_coordinate_calculation(self):
-        """Test coordinate calculation for different levels."""
-        # Test level 0
-        ds0 = xr.open_dataset(self.test_file, engine='amrex', level=0)
-        
-        # Verify coordinates exist and are reasonable
-        assert 'x' in ds0.coords
-        assert 'y' in ds0.coords
-        
-        x_coord = ds0.coords['x']
-        y_coord = ds0.coords['y']
-        
-        # Check coordinate properties
-        assert len(x_coord) > 0
-        assert len(y_coord) > 0
-        assert np.all(np.diff(x_coord) > 0)  # Should be monotonically increasing
-        assert np.all(np.diff(y_coord) > 0)  # Should be monotonically increasing
-        
-        print("✓ Coordinate calculation test passed")
-    
-    def test_multilevel_access(self):
-        """Test accessing different AMR levels."""
-        meta = AMReXDatasetMeta(self.test_file)
-        
-        # Test level 0
-        ds0 = xr.open_dataset(self.test_file, engine='amrex', level=0)
-        assert ds0.attrs['level'] == 0
-        
-        # Test level 1 if it exists
-        if meta.max_level >= 1:
-            ds1 = xr.open_dataset(self.test_file, engine='amrex', level=1)
-            assert ds1.attrs['level'] == 1
-            
-            # Level 1 should have higher resolution
-            assert len(ds1.coords['x']) >= len(ds0.coords['x'])
-            assert len(ds1.coords['y']) >= len(ds0.coords['y'])
-        
-        print("✓ Multilevel access test passed")
-    
-    def test_utilities_functions(self):
-        """Test utility functions."""
-        # Test open_amrex_levels
-        levels_dict = xamrex.open_amrex_levels(self.test_file)
-        assert isinstance(levels_dict, dict)
-        assert 0 in levels_dict
-        
-        # Test get_available_levels_from_file
-        available_levels = xamrex.get_available_levels_from_file(self.test_file)
-        assert isinstance(available_levels, list)
-        assert 0 in available_levels
-        
-        # Test get_max_level
-        max_level = xamrex.get_max_level(self.test_file)
-        assert isinstance(max_level, int)
-        assert max_level >= 0
-        
-        print("✓ Utility functions test passed")
-    
-    def test_data_integrity(self):
-        """Test data integrity and reasonable values."""
-        ds = xr.open_dataset(self.test_file, engine='amrex', level=0)
-        
-        # Get first data variable
-        var_name = list(ds.data_vars.keys())[0]
-        data_var = ds[var_name]
-        
-        # Compute a small subset of data
-        subset = data_var.isel(x=slice(0, 10), y=slice(0, 10)).compute()
-        
-        # Check for reasonable values (not all NaN, not all zeros)
-        valid_data = subset.data[~np.isnan(subset.data)]
-        if len(valid_data) > 0:
-            assert not np.all(valid_data == 0), "Data should not be all zeros"
-            assert np.all(np.isfinite(valid_data)), "Data should be finite"
-        
-        print("✓ Data integrity test passed")
+        # Compute and check for NaN
+        data = dask_array.compute()
+        assert np.all(np.isnan(data))
 
-def run_tests():
-    """Run all tests."""
-    print("Running xamrex test suite...")
-    print("=" * 50)
+
+class TestBackend:
+    """Test xarray backend integration."""
     
-    try:
-        test_instance = TestXamrex()
+    def test_single_file_loading(self):
+        """Test loading a single plotfile."""
+        import xarray as xr
         
-        # Run all test methods
-        test_methods = [method for method in dir(test_instance) if method.startswith('test_')]
+        ds = xr.open_dataset(
+            PLOTFILE_0,
+            engine='xamrex',
+            level=0
+        )
         
-        passed = 0
-        failed = 0
+        assert isinstance(ds, xr.Dataset)
+        assert 'ocean_time' in ds.coords
+        assert len(ds.data_vars) > 0
+    
+    def test_time_series_loading(self):
+        """Test loading multiple plotfiles as time series."""
+        import xarray as xr
         
-        for method_name in test_methods:
-            try:
-                method = getattr(test_instance, method_name)
-                method()
-                passed += 1
-            except Exception as e:
-                print(f"✗ {method_name} failed: {e}")
-                failed += 1
+        ds = xr.open_dataset(
+            [PLOTFILE_0, PLOTFILE_360],
+            engine='xamrex',
+            level=0
+        )
         
-        print("=" * 50)
-        print(f"Tests completed: {passed} passed, {failed} failed")
+        assert isinstance(ds, xr.Dataset)
+        assert 'ocean_time' in ds.coords
+        assert len(ds.ocean_time) == 2
+    
+    def test_xgcm_metadata(self):
+        """Test that xgcm-compatible metadata is present."""
+        import xarray as xr
         
-        if failed == 0:
-            print("🎉 All tests passed!")
-            return True
-        else:
-            print("❌ Some tests failed!")
-            return False
-            
-    except Exception as e:
-        print(f"Test setup failed: {e}")
-        return False
+        ds = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        
+        assert 'xgcm-Grid' in ds.attrs
+        grid_spec = ds.attrs['xgcm-Grid']
+        assert isinstance(grid_spec, dict)
+    
+    def test_coordinate_attributes(self):
+        """Test that coordinates have proper attributes."""
+        import xarray as xr
+        
+        ds = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        
+        # Check rho coordinates
+        if 'x_rho' in ds.coords:
+            assert 'axis' in ds.x_rho.attrs
+            assert 'c_grid_axis_shift' in ds.x_rho.attrs
+        
+        # Check u coordinates if present
+        if 'x_u' in ds.coords:
+            assert 'axis' in ds.x_u.attrs
+            assert ds.x_u.attrs['c_grid_axis_shift'] == -0.5
+    
+    def test_lazy_loading(self):
+        """Test that data is loaded lazily."""
+        import xarray as xr
+        import dask.array as da
+        
+        ds = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        
+        # Data should be dask arrays
+        for var_name in ds.data_vars:
+            assert isinstance(ds[var_name].data, da.Array)
+    
+    def test_drop_variables(self):
+        """Test dropping variables."""
+        import xarray as xr
+        
+        ds_full = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        var_to_drop = list(ds_full.data_vars)[0]
+        
+        ds_dropped = xr.open_dataset(
+            PLOTFILE_0,
+            engine='xamrex',
+            level=0,
+            drop_variables=var_to_drop
+        )
+        
+        assert var_to_drop not in ds_dropped.data_vars
+        assert len(ds_dropped.data_vars) == len(ds_full.data_vars) - 1
+
+
+class TestIntegration:
+    """Integration tests with ocean_out data."""
+    
+    def test_detect_all_grids(self):
+        """Test that all expected grids are detected."""
+        import xarray as xr
+        
+        ds = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        
+        # Check for various coordinate types
+        coord_types = set()
+        for coord in ds.coords:
+            if '_' in str(coord):
+                grid_type = str(coord).split('_')[1]
+                coord_types.add(grid_type)
+        
+        assert len(coord_types) > 0
+    
+    def test_variable_grid_mapping(self):
+        """Test that variables are on correct grids."""
+        import xarray as xr
+        
+        ds = xr.open_dataset(PLOTFILE_0, engine='xamrex', level=0)
+        
+        # Check variable attributes
+        for var_name in ds.data_vars:
+            assert 'grid' in ds[var_name].attrs
+            assert 'directory' in ds[var_name].attrs
+    
+    def test_time_series_shapes(self):
+        """Test that time series have consistent spatial shapes."""
+        import xarray as xr
+        
+        ds = xr.open_dataset(ALL_PLOTFILES[:2], engine='xamrex', level=0)
+        
+        for var_name in ds.data_vars:
+            var = ds[var_name]
+            # First dimension should be time
+            assert var.dims[0] == 'ocean_time'
+            assert var.shape[0] == 2  # Two timesteps
+
 
 if __name__ == "__main__":
-    success = run_tests()
-    sys.exit(0 if success else 1)
+    pytest.main([__file__, "-v"])
