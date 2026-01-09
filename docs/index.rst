@@ -1,9 +1,7 @@
 xamrex
 ======
 
-A simplified xarray backend for reading AMReX plotfiles with lazy dask loading.
-
-xamrex provides an efficient way to work with AMReX simulation data in Python, integrating seamlessly with the xarray ecosystem for analysis and visualization.
+An xarray backend for reading AMReX plotfiles with C-grid staggered variable support and multi-level AMR.
 
 .. toctree::
    :maxdepth: 2
@@ -13,14 +11,16 @@ xamrex provides an efficient way to work with AMReX simulation data in Python, i
    usage
    api
 
-Key Features
-------------
+Overview
+--------
 
-* **xarray Integration**: Seamless integration with xarray for familiar data analysis workflows
-* **Lazy Loading**: Efficient memory usage with dask-backed lazy loading
-* **Single-Level Focus**: Simplified interface focusing on single AMR level access
-* **Multi-Level Utilities**: Utility functions for exploring and working with multi-level AMR data
-* **Performance**: Optimized for large datasets with minimal memory footprint
+xamrex provides a simple xarray backend for AMReX simulation data with:
+
+* **C-grid Support** - Automatic handling of staggered variables (rho, u, v, w, psi points)
+* **Multi-level AMR** - Proper coordinate scaling for refined levels
+* **Time Series** - Load multiple plotfiles with automatic concatenation
+* **Lazy Loading** - Efficient memory usage via dask arrays
+* **xgcm Compatible** - Grid-aware operations with xgcm
 
 Quick Start
 -----------
@@ -28,22 +28,34 @@ Quick Start
 .. code-block:: python
 
    import xarray as xr
-   import xamrex
+   from glob import glob
 
-   # Load AMReX plotfile as xarray dataset
-   ds = xr.open_dataset('path/to/plotfile', engine='amrex', level=0)
+   # Single plotfile
+   ds = xr.open_dataset('plt00000', engine='amrex', level=0)
    
-   # Access data variables
-   temperature = ds['temp']
-   salinity = ds['salt']
+   # Time series
+   files = sorted(glob('ocean_out/plt*'))
+   ds = xr.open_dataset(files, engine='amrex', level=0)
    
-   # Use utility functions for multi-level analysis
-   levels = xamrex.open_amrex_levels('path/to/plotfile')
-   max_level = xamrex.get_max_level('path/to/plotfile')
+   # Refined level with proper coordinate scaling
+   ds_level1 = xr.open_dataset(files, engine='amrex', level=1)
+   
+   # Access C-grid variables
+   temp = ds['temp']      # rho-points: (ocean_time, z_rho, y_rho, x_rho)
+   u_vel = ds['u_vel']    # u-points:   (ocean_time, z_rho, y_u, x_u)
+   v_vel = ds['v_vel']    # v-points:   (ocean_time, z_rho, y_v, x_v)
 
-Indices and tables
-==================
+Installation
+------------
+
+.. code-block:: bash
+
+   pip install -e .
+
+Requirements: Python ≥3.8, xarray, numpy, dask, pandas
+
+Indices
+=======
 
 * :ref:`genindex`
-* :ref:`modindex`
 * :ref:`search`
