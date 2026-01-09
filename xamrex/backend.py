@@ -1,604 +1,406 @@
 """
-Single-level AMReX backend with lazy dask loading.
-Each dataset represents a single AMR level with full domain dimensions and masked arrays.
+Xarray backend for C-grid AMReX plotfiles with automatic grid detection.
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Hashable, Iterable
+from typing import Any, Iterable, List, Dict
 import os
-import struct
 
 import numpy as np
-import dask.array as da
 import xarray as xr
 from xarray.backends.common import (
     AbstractDataStore,
     BackendArray,
     BackendEntrypoint,
-    ReadBuffer,
 )
 from xarray.core.variable import Variable
 
-from .AMReX_array import AMReXDatasetMeta, AMReXFabsMetaSingleLevel
-from .refinement import create_refinement_handler
+from .metadata import AMReXBasicMeta, AMReXMultiGridMeta
+from .coordinates import CGridCoordinateGenerator
+from .fab_loader import FABMetadata, FABLoader, MaskedFABLoader
 
 
-class AMReXLazyArray(BackendArray):
+class AMReXCGridStore(AbstractDataStore):
     """
-    Simplified lazy array wrapper for AMReX data using dask for memory efficiency.
-    Represents a single field at a single AMR level.
+    Xarray data store for C-grid AMReX plotfiles.
+    
+    Supports:
+    - Multiple grid types (rho, u, v, w, psi)
+    - 2D and 3D variables
+    - Multi-file time series
+    - Level masking across time
+    - xgcm-compatible metadata
     """
     
-    def __init__(self, fplt: Path, level: int, field_name: str, 
-                 meta: AMReXDatasetMeta, fab_meta: AMReXFabsMetaSingleLevel):
-        self.fplt = fplt
+    def __init__(self, plotfile_paths: List[Path], level: int = 0):
+        """
+        Initialize C-grid store.
+        
+        Parameters
+        ----------
+        plotfile_paths : list of Path
+            Plotfile directories (single or multiple for time series)
+        level : int, default 0
+            AMR level to load
+        """
+        self.plotfile_paths = [Path(p) for p in plotfile_paths]
         self.level = level
-        self.field_name = field_name
-        self.meta = meta
-        self.fab_meta = fab_meta
-        self.field_idx = meta.field_list.index(field_name)
+        self.is_time_series = len(self.plotfile_paths) > 1
         
-        # Use the new RefinementHandler for all refinement calculations
-        self.refinement_handler = create_refinement_handler(meta)
+        # Parse metadata
+        if self.is_time_series:
+            self.meta = AMReXMultiGridMeta(self.plotfile_paths)
+        else:
+            # Single file - create simple metadata
+            self.basic_meta = AMReXBasicMeta(self.plotfile_paths[0])
+            # Wrap in multi-grid structure for consistency
+            self.meta = AMReXMultiGridMeta(self.plotfile_paths)
         
-        # Get array shape using the refinement handler
-        self.shape = self.refinement_handler.get_full_shape(level, include_time=True)
-        self.dtype = np.float64
+        # Initialize coordinate generator with level and refinement info
+        self.coord_gen = CGridCoordinateGenerator(
+            self.meta.basic_meta.domain_left_edge,
+            self.meta.basic_meta.domain_right_edge,
+            self.meta.basic_meta.level_dimensions,
+            self.meta.basic_meta.dimensionality,
+            refinement_factors=self.meta.basic_meta.ref_factors,
+            level=level
+        )
         
-        # Create a dask array that will actually load data when accessed
-        self.dask_array = self._create_dask_array()
-    
-    @property
-    def itemsize(self):
-        """Return the itemsize of the dtype."""
-        return self.dtype.itemsize
-    
-    @property
-    def size(self):
-        """Return the total number of elements."""
-        return int(np.prod(self.shape))
-    
-    @property
-    def nbytes(self):
-        """Return the total number of bytes."""
-        return self.size * self.itemsize
-    
-    def _create_dask_array(self):
-        """Create a dask array that loads AMReX data on demand."""
-        # Create a dask array using from_delayed with the actual data loading function
-        from dask import delayed
-        
-        @delayed
-        def load_amrex_data():
-            return self._load_full_field_data()
-        
-        # Create dask array from the delayed computation
-        lazy_data = load_amrex_data()
-        return da.from_delayed(lazy_data, shape=self.shape, dtype=self.dtype)
-    
-    def _load_full_field_data(self):
-        """Load the complete field data from all FABs and assemble into full grid."""
-        # FIXED ISSUE 2: Initialize full grid with NaN for missing values instead of zeros
-        full_data = np.full(self.shape, np.nan, dtype=np.float64)
-        
-        # Load data from each FAB and place it in the correct location
-        for fab_idx, fab_row in self.fab_meta.metadata.iterrows():
-            # Read data from this FAB
-            fab_data = self._read_fab_data(fab_idx)
-            
-            # Get index ranges for this FAB
-            lo_i, lo_j, lo_k = fab_row['lo_i'], fab_row['lo_j'], fab_row['lo_k']
-            hi_i, hi_j, hi_k = fab_row['hi_i'], fab_row['hi_j'], fab_row['hi_k']
-            
-            # Direct mapping using actual FAB indices
-            if self.meta.dimensionality == 3:
-                # 3D case: (time, z, y, x)
-                full_data[0, lo_k:hi_k, lo_j:hi_j, lo_i:hi_i] = fab_data
-            else:
-                # 2D case: (time, y, x)
-                full_data[0, lo_j:hi_j, lo_i:hi_i] = fab_data
-        
-        return full_data
-    
-    def _read_fab_data(self, fab_idx):
-        """Read data for a specific field from a specific FAB."""
-        fab_row = self.fab_meta.metadata.loc[fab_idx]
-        fab_file = self.fplt / f"Level_{self.level}" / fab_row['filename']
-        
-        # Calculate fab dimensions
-        di, dj, dk = fab_row['di'], fab_row['dj'], fab_row['dk']
-        cells_per_fab = di * dj * dk
-        
-        # Open fab file and seek to the data for this field
-        with open(fab_file, 'rb') as f:
-            # Skip to the byte offset for this fab
-            f.seek(fab_row['byte_offset'])
-            
-            # Skip the metadata line to get to data start
-            f.readline()
-            data_start = f.tell()
-            
-            # FIXED: AMReX stores data in blocked format: all field0 data, then all field1 data, etc.
-            # Calculate the start position for this field's data block
-            field_start = data_start + self.field_idx * cells_per_fab * 8  # 8 bytes per float64
-            
-            # Seek to the start of this field's data block
-            f.seek(field_start)
-            
-            # Read all data for this field at once
-            field_bytes = f.read(cells_per_fab * 8)
-            
-            if len(field_bytes) == cells_per_fab * 8:
-                # Unpack all values at once (much more efficient)
-                field_data = struct.unpack(f'<{cells_per_fab}d', field_bytes)
-            else:
-                # Fallback: read individual values
-                field_data = []
-                f.seek(field_start)
-                for cell_idx in range(cells_per_fab):
-                    value_bytes = f.read(8)
-                    if len(value_bytes) == 8:
-                        value = struct.unpack('<d', value_bytes)[0]
-                        field_data.append(value)
-                    else:
-                        field_data.append(0.0)
-            
-            # Reshape to fab dimensions (in C order: k,j,i since AMReX uses C ordering in files)
-            if self.meta.dimensionality == 3:
-                fab_data = np.array(field_data, dtype=np.float64).reshape((dk, dj, di))
-            else:
-                fab_data = np.array(field_data, dtype=np.float64).reshape((dj, di))
-                
-            return fab_data
-    
-    def get_array(self):
-        """Return the underlying dask array."""
-        return self.dask_array
-    
-    def __getitem__(self, key):
-        """Get array slice with proper xarray indexing support."""
-        # Handle xarray indexing objects
-        if hasattr(key, 'tuple'):
-            # BasicIndexer and other xarray indexing objects
-            key = key.tuple
-        elif hasattr(key, '__getitem__') and not isinstance(key, (tuple, slice, int, np.integer)):
-            # Convert other indexing objects to tuple
-            try:
-                key = tuple(key)
-            except (TypeError, ValueError):
-                # If conversion fails, try to extract the indexing information
-                if hasattr(key, 'indices'):
-                    key = key.indices
-                else:
-                    # Fallback to identity slicing
-                    key = tuple(slice(None) for _ in self.shape)
-        
-        return self.dask_array[key]
-
-
-class AMReXSingleLevelStore(AbstractDataStore):
-    """
-    Data store for a single AMR level from an AMReX plotfile.
-    """
-    
-    def __init__(self, plotfile_path: Path, level: int = 0, time_dimension_name: str = None, dimension_names: dict = None):
-        self.plotfile_path = Path(plotfile_path)
-        self.level = level
-        
-        # Parse metadata with configurable dimension names
-        self.meta = AMReXDatasetMeta(plotfile_path, time_dimension_name, dimension_names)
-        
-        # Validate level exists
-        if level > self.meta.max_level:
-            raise ValueError(f"Level {level} not available. Max level: {self.meta.max_level}")
-        
-        # Get fab metadata for this level
-        try:
-            self.fab_meta = AMReXFabsMetaSingleLevel(
-                plotfile_path, self.meta.n_fields, self.meta.dimensionality, level
+        # Check if requested level ever exists
+        if level not in self.meta.level_availability:
+            raise ValueError(
+                f"Level {level} never appears in provided plotfiles. "
+                f"Available levels: {list(self.meta.level_availability.keys())}"
             )
-        except FileNotFoundError:
-            raise ValueError(f"Level {level} directory not found in {plotfile_path}")
     
-    def get_variables(self):
-        """Return variables for all fields at this level."""
+    def get_variables(self) -> Dict[str, Variable]:
+        """Return all variables including coordinates and data variables."""
         variables = {}
         
-        # Use RefinementHandler for coordinate calculations
-        refinement_handler = create_refinement_handler(self.meta)
-        
-        # Get time dimension name
-        time_dim_name = getattr(self.meta, 'time_dimension_name', 'ocean_time')
-        
-        # Create dimension names with the configurable time dimension
-        if self.meta.dimensionality == 3:
-            dim_names = [time_dim_name, 'z', 'y', 'x']  # Add time dimension
-        else:
-            dim_names = [time_dim_name, 'y', 'x']       # Add time dimension for 2D
-        
-        # Create time coordinate (singleton dimension)
-        variables[time_dim_name] = Variable(
-            dims=(time_dim_name,),
-            data=np.array([self.meta.current_time]),
+        # Create time coordinate
+        variables['ocean_time'] = Variable(
+            dims=('ocean_time',),
+            data=self.meta.time_values,
             attrs={
-                'long_name': 'Time',
-                'units': 'unknown',  # TODO: extract units from AMReX if available
+                'long_name': 'time',
+                'units': 'seconds',  # TODO: extract from AMReX if available
             }
         )
         
-        # Generate spatial coordinates using RefinementHandler
-        coord_arrays = refinement_handler.get_coordinate_arrays(
-            self.level, self.meta.domain_left_edge, self.meta.domain_right_edge
-        )
-        
-        # Create spatial coordinate variables
-        refinement_factors = refinement_handler.get_refinement_factors(self.level)
-        for dim_name, coord_array in coord_arrays.items():
-            dim_idx = ['x', 'y', 'z'].index(dim_name)
-            refinement_factor = refinement_factors[dim_idx]
+        # Generate z-coordinates once from level dimensions (shared across all grids)
+        if self.meta.basic_meta.dimensionality == 3:
+            # Generate z_rho coordinate from level dimensions
+            level_dims = self.meta.basic_meta.level_dimensions[self.level]
+            nz_rho = level_dims[2] if len(level_dims) > 2 else 32
             
-            # Calculate spacing info
-            if len(coord_array) > 1:
-                spacing = coord_array[1] - coord_array[0]
+            z_rho_coord = self.coord_gen._generate_z_coordinate(nz_rho, 'rho')
+            variables['z_rho'] = Variable(
+                dims=('z_rho',),
+                data=z_rho_coord,
+                attrs=self.coord_gen._get_coordinate_attrs('z_rho', 'Z', 'rho')
+            )
+            
+            # Generate z_w coordinate from WFace dimensions if it exists
+            if 'WFace' in self.meta.all_grids:
+                wface_dims = self.meta.all_grids['WFace']['dimensions']
+                nz_w = wface_dims[2] if len(wface_dims) > 2 else nz_rho + 1
+                z_w_coord = self.coord_gen._generate_z_coordinate(nz_w, 'w')
+                variables['z_w'] = Variable(
+                    dims=('z_w',),
+                    data=z_w_coord,
+                    attrs=self.coord_gen._get_coordinate_attrs('z_w', 'Z', 'w')
+                )
+        
+        # Generate horizontal coordinates for each discovered grid type
+        # Use level-specific dimensions, not cached dimensions from all_grids
+        from .grid_detector import GridDetector
+        detector = GridDetector()
+        level_grids = detector.detect_grids(self.plotfile_paths[0], self.level)
+        
+        coords_created = set()
+        for dir_name, grid_info in level_grids.items():
+            grid_type = grid_info['grid_type']
+            
+            # Generate only x and y coordinates (z is shared)
+            coords = self.coord_gen.generate_xy_coordinates(
+                grid_type, grid_dimensions=grid_info['dimensions']
+            )
+            
+            # Add coordinates (avoid duplicates)
+            for coord_name, (dim_name, coord_array, attrs) in coords.items():
+                if coord_name not in coords_created:
+                    variables[coord_name] = Variable(
+                        dims=(dim_name,),
+                        data=coord_array,
+                        attrs=attrs
+                    )
+                    coords_created.add(coord_name)
+        
+        # Get reference z-dimensions for coordinate assignment
+        level_dims = self.meta.basic_meta.level_dimensions[self.level]
+        nz_rho = level_dims[2] if len(level_dims) > 2 else 32
+        nz_w = nz_rho + 1  # w-points have one extra vertical level
+        
+        # Create data variables
+        for var_name in self.meta.basic_meta.field_list:
+            # Determine which grid this variable belongs to
+            dir_name = self.meta.get_variable_grid(var_name)
+            grid_info = self.meta.get_grid_info(dir_name)
+            
+            if not grid_info:
+                print(f"Warning: No grid info for variable {var_name}, skipping")
+                continue
+            
+            grid_type = grid_info['grid_type']
+            is_2d = grid_info['dimensionality'] == 2
+            
+            # Create lazy array
+            lazy_array = self._create_lazy_array(var_name, dir_name, grid_info)
+            
+            # Get dimension names with automatic z-coordinate detection
+            if is_2d:
+                dim_names = self.coord_gen.get_dimension_names(grid_type, is_2d)
             else:
-                spacing = 0.0
+                # For 3D variables, determine correct z-coordinate based on actual grid dimensions
+                grid_dims = grid_info['dimensions']
+                nz_actual = grid_dims[2] if len(grid_dims) > 2 else nz_rho
+                
+                # Get base dimension names (will have z_rho by default)
+                dim_names = list(self.coord_gen.get_dimension_names(grid_type, is_2d))
+                
+                # Replace z-coordinate based on actual vertical dimension
+                if nz_actual == nz_w:
+                    # This grid has w-points in vertical - use z_w
+                    dim_names[1] = 'z_w'
+                # else: keep z_rho (default)
             
-            base_spacing = spacing * refinement_factor
-            
-            variables[dim_name] = Variable(
-                dims=(dim_name,),
-                data=coord_array,
-                attrs={
-                    'long_name': f'{dim_name.upper()} coordinate',
-                    'units': 'unknown',  # TODO: extract from AMReX if available
-                    'spacing': float(spacing),
-                    'base_spacing': float(base_spacing),
-                    'refinement_factor': int(refinement_factor),
-                }
-            )
-        
-        # Create data variables for each field
-        base_refinement = refinement_handler.base_refinement
-        for field in self.meta.field_list:
-            # Create lazy array wrapper
-            lazy_array = AMReXLazyArray(
-                self.plotfile_path, self.level, field, self.meta, self.fab_meta
-            )
-            
-            # Use the dask array directly instead of the wrapper
-            variables[field] = Variable(
+            # Create variable
+            variables[var_name] = Variable(
                 dims=dim_names,
-                data=lazy_array.dask_array,
+                data=lazy_array,
                 attrs={
-                    'long_name': field,
-                    'level': int(self.level),
-                    'refinement_factor': int(base_refinement ** self.level),
+                    'long_name': var_name,
+                    'grid': grid_type,
+                    'directory': dir_name,
                     '_FillValue': np.nan,
                 }
             )
         
         return variables
     
-    def get_dimensions(self):
-        """Return dimensions for this level using header data."""
-        # Use actual dimensions from header instead of calculations
-        level_dims = self.meta.get_level_dimensions(self.level)
+    def _create_lazy_array(self, var_name: str, dir_name: str, 
+                          grid_info: Dict) -> Any:
+        """
+        Create lazy dask array for a variable.
         
-        # Use Fortran order dimension names to match data layout
-        if self.meta.dimensionality == 3:
-            dim_names = ['z', 'y', 'x']  # Fortran order for 3D
-            coord_indices = [2, 1, 0]    # Map to original x,y,z indices
+        Handles both single file and time series cases, with masking.
+        """
+        import dask.array as da
+        
+        # Get the component index for this variable within its grid
+        var_index = self.meta.basic_meta.variable_to_component_index.get(var_name, 0)
+        
+        # Get dimensions for the REQUESTED level, not from cached grid_info
+        # grid_info['dimensions'] may be from a different level!
+        # Instead, we need to detect the grid at the current level
+        is_2d = grid_info['dimensionality'] == 2
+        
+        # Get dimensions by actually reading the grid at this level
+        # We'll use the first plotfile to determine dimensions
+        from .grid_detector import GridDetector
+        detector = GridDetector()
+        level_grids = detector.detect_grids(self.plotfile_paths[0], self.level)
+        
+        if dir_name in level_grids:
+            dimensions = level_grids[dir_name]['dimensions']
         else:
-            dim_names = ['y', 'x']       # Fortran order for 2D  
-            coord_indices = [1, 0]       # Map to original x,y indices
+            # Fallback to grid_info dimensions (shouldn't happen)
+            dimensions = grid_info['dimensions']
+        
+        # Use dimensions as-is from grid detector
+        # No stagger adjustments needed - they're already included!
+        if is_2d:
+            # 2D: dimensions are (nx, ny)
+            spatial_shape = (dimensions[1], dimensions[0])  # (ny, nx) in C-order
+        else:
+            # 3D: dimensions are (nx, ny, nz)
+            spatial_shape = (dimensions[2], dimensions[1], dimensions[0])  # (nz, ny, nx)
+        
+        if self.is_time_series:
+            # Time series: concatenate along time
+            time_arrays = []
             
-        return {dim: level_dims[coord_indices[i]] for i, dim in enumerate(dim_names)}
-    
-    def get_attrs(self):
-        """Return global attributes."""
-        return {
-            'title': f'AMReX Plotfile Level {self.level}: {self.plotfile_path.name}',
-            'plotfile_path': str(self.plotfile_path),
-            'level': int(self.level),
-            'max_level': int(self.meta.max_level),
-            'current_time': float(self.meta.current_time),
-            'dimensionality': int(self.meta.dimensionality),
-            'geometry': str(self.meta.geometry),
-            'domain_left_edge': self.meta.domain_left_edge.tolist(),
-            'domain_right_edge': self.meta.domain_right_edge.tolist(),
-            'refinement_factor': int(self.meta.ref_factors[0] ** self.level),
-            'base_refinement_factors': list(self.meta.ref_factors),
-            'fields': self.meta.field_list,
-        }
-
-
-class AMReXMultiTimeStore(AbstractDataStore):
-    """
-    Data store for multiple AMReX plotfiles concatenated along time dimension.
-    """
-    
-    def __init__(self, plotfile_paths: list, level: int = 0, 
-                 time_dimension_name: str = None, dimension_names: dict = None):
-        """
-        Initialize multi-time store.
-        
-        Parameters
-        ----------
-        plotfile_paths : list of str or Path
-            List of paths to AMReX plotfile directories
-        level : int, default 0
-            AMR level to load from each plotfile
-        time_dimension_name : str, optional
-            Name for the time dimension (default: 'ocean_time')
-        dimension_names : dict, optional
-            Custom dimension names
-        """
-        self.plotfile_paths = [Path(p) for p in plotfile_paths]
-        self.level = level
-        self.time_dimension_name = time_dimension_name or 'ocean_time'
-        self.dimension_names = dimension_names or {}
-        
-        # Validate all plotfiles exist and can be opened (but don't require all to have the level)
-        self.stores = []
-        self.times = []
-        
-        for path in self.plotfile_paths:
-            try:
-                # Just create a basic store to get metadata and time, not necessarily for this level
-                meta_store = AMReXSingleLevelStore(path, 0, time_dimension_name, dimension_names)  # Always use level 0 for metadata
-                self.stores.append(meta_store)
-                self.times.append(meta_store.meta.current_time)
-            except Exception as e:
-                raise ValueError(f"Failed to open plotfile {path}: {e}")
-        
-        # Sort by time to ensure proper ordering
-        sorted_indices = np.argsort(self.times)
-        self.stores = [self.stores[i] for i in sorted_indices]
-        self.times = [self.times[i] for i in sorted_indices]
-        self.plotfile_paths = [self.plotfile_paths[i] for i in sorted_indices]
-        
-        # Use first store as reference for metadata
-        self.reference_store = self.stores[0]
-        
-        # Validate compatibility across all stores
-        self._validate_compatibility()
-    
-    def _validate_compatibility(self):
-        """Validate that all plotfiles are compatible for concatenation."""
-        ref_meta = self.reference_store.meta
-        
-        # Find the first file that has the requested level to use as spatial template
-        self.level_template_store = None
-        for store in self.stores:
-            if store.meta.max_level >= self.level:
-                try:
-                    # Try to create the store for this level to ensure it works
-                    test_store = AMReXSingleLevelStore(
-                        store.plotfile_path, self.level, 
-                        self.time_dimension_name, self.dimension_names
-                    )
-                    self.level_template_store = test_store
-                    break
-                except Exception:
-                    continue
-        
-        if self.level_template_store is None:
-            raise ValueError(f"Level {self.level} not available in any of the provided files")
-        
-        for i, store in enumerate(self.stores[1:], 1):
-            meta = store.meta
-            
-            # Check spatial dimensions
-            if meta.dimensionality != ref_meta.dimensionality:
-                raise ValueError(f"Dimensionality mismatch: {meta.dimensionality} vs {ref_meta.dimensionality}")
-            
-            # Check field compatibility (only for files that have data)
-            if set(meta.field_list) != set(ref_meta.field_list):
-                raise ValueError(f"Field list mismatch in file {i}")
-            
-            # Check domain compatibility
-            if not np.allclose(meta.domain_left_edge, ref_meta.domain_left_edge):
-                raise ValueError(f"Domain left edge mismatch in file {i}")
-            
-            if not np.allclose(meta.domain_right_edge, ref_meta.domain_right_edge):
-                raise ValueError(f"Domain right edge mismatch in file {i}")
-            
-            # Note: We no longer require all files to have the requested level
-            # Missing levels will be filled with NaN values
-    
-    def get_variables(self):
-        """Return variables concatenated along time dimension."""
-        variables = {}
-        
-        # Get variables from level template store to establish spatial structure
-        template_vars = self.level_template_store.get_variables()
-        
-        # Create time coordinate from all files
-        time_values = np.array(self.times)
-        variables[self.time_dimension_name] = Variable(
-            dims=(self.time_dimension_name,),
-            data=time_values,
-            attrs={
-                'long_name': 'Time',
-                'units': 'unknown',  # TODO: extract units from AMReX if available
-            }
-        )
-        
-        # Add spatial coordinates from level template (same for all time steps at this level)
-        for name, var in template_vars.items():
-            if name != self.time_dimension_name and name in ['x', 'y', 'z']:
-                variables[name] = var
-        
-        # Concatenate data variables along time dimension
-        for field_name in self.level_template_store.meta.field_list:
-            # Collect data arrays from all time steps
-            data_arrays = []
-            
-            for store in self.stores:
-                # Check if this store has the requested level
-                if store.meta.max_level >= self.level:
+            for time_idx, pf_path in enumerate(self.plotfile_paths):
+                # Check if level exists at this timestep
+                if self.meta.is_level_available(self.level, time_idx):
+                    # Load data
+                    full_shape = (1,) + spatial_shape
                     try:
-                        # Try to load this level
-                        level_store = AMReXSingleLevelStore(
-                            store.plotfile_path, self.level,
-                            self.time_dimension_name, self.dimension_names
+                        fab_meta = FABMetadata(
+                            pf_path, self.level, dir_name,
+                            grid_info['num_components'],
+                            grid_info['dimensionality']
                         )
-                        store_vars = level_store.get_variables()
-                        
-                        if field_name in store_vars:
-                            # Convert Variable to DataArray for concatenation
-                            var = store_vars[field_name]
-                            data_array = xr.DataArray(var.data, dims=var.dims, attrs=var.attrs)
-                            data_arrays.append(data_array)
-                        else:
-                            # Field missing in this file - create NaN DataArray
-                            template_var = template_vars[field_name]
-                            nan_data = np.full(template_var.shape, np.nan)
-                            nan_array = xr.DataArray(nan_data, dims=template_var.dims, attrs=template_var.attrs)
-                            data_arrays.append(nan_array)
-                            
-                    except Exception:
-                        # Level exists in header but can't be loaded - create NaN DataArray
-                        template_var = template_vars[field_name]
-                        nan_data = np.full(template_var.shape, np.nan)
-                        nan_array = xr.DataArray(nan_data, dims=template_var.dims, attrs=template_var.attrs)
-                        data_arrays.append(nan_array)
+                        loader = FABLoader(
+                            pf_path, self.level, dir_name,
+                            var_index, fab_meta, full_shape
+                        )
+                        time_arrays.append(loader.create_dask_array())
+                    except Exception as e:
+                        print(f"Warning: Failed to load {var_name} at time {time_idx}: {e}")
+                        # Create masked array
+                        masked_loader = MaskedFABLoader(full_shape)
+                        time_arrays.append(masked_loader.create_dask_array())
                 else:
-                    # Level doesn't exist in this file - create NaN DataArray
-                    template_var = template_vars[field_name]
-                    nan_data = np.full(template_var.shape, np.nan)
-                    nan_array = xr.DataArray(nan_data, dims=template_var.dims, attrs=template_var.attrs)
-                    data_arrays.append(nan_array)
+                    # Level doesn't exist - create masked array
+                    full_shape = (1,) + spatial_shape
+                    masked_loader = MaskedFABLoader(full_shape)
+                    time_arrays.append(masked_loader.create_dask_array())
             
-            # Use xarray's concat function to properly handle dask arrays
-            concatenated_array = xr.concat(data_arrays, dim=self.time_dimension_name)
-            
-            # Convert back to Variable and update attributes
-            concatenated_var = Variable(
-                dims=concatenated_array.dims,
-                data=concatenated_array.data,
-                attrs={
-                    **concatenated_array.attrs,
-                    'concatenated_files': len(self.plotfile_paths),
-                    'time_range': f"{self.times[0]} to {self.times[-1]}",
-                    'level': self.level,
-                    'missing_levels_filled_with_nan': True,
-                }
-            )
-            
-            variables[field_name] = concatenated_var
-        
-        return variables
+            # Concatenate along time dimension
+            return da.concatenate(time_arrays, axis=0)
+        else:
+            # Single file
+            full_shape = (1,) + spatial_shape
+            try:
+                fab_meta = FABMetadata(
+                    self.plotfile_paths[0], self.level, dir_name,
+                    grid_info['num_components'],
+                    grid_info['dimensionality']
+                )
+                loader = FABLoader(
+                    self.plotfile_paths[0], self.level, dir_name,
+                    var_index, fab_meta, full_shape
+                )
+                return loader.create_dask_array()
+            except Exception as e:
+                print(f"Warning: Failed to load {var_name}: {e}")
+                masked_loader = MaskedFABLoader(full_shape)
+                return masked_loader.create_dask_array()
     
-    def get_attrs(self):
-        """Return global attributes."""
-        ref_attrs = self.reference_store.get_attrs()
-        
-        return {
-            **ref_attrs,
-            'title': f'Multi-time AMReX Dataset Level {self.level}',
-            'concatenated_files': len(self.plotfile_paths),
-            'time_steps': len(self.times),
-            'time_range': f"{self.times[0]} to {self.times[-1]}",
-            'plotfile_paths': [str(p) for p in self.plotfile_paths],
-            'source_files': [p.name for p in self.plotfile_paths],
+    def get_attrs(self) -> Dict:
+        """Return global attributes including xgcm grid metadata."""
+        attrs = {
+            'title': f'C-grid AMReX Plotfile Level {self.level}',
+            'level': self.level,
+            'max_level_ever': self.meta.max_level_ever,
+            'dimensionality': self.meta.basic_meta.dimensionality,
+            'domain_left_edge': self.meta.basic_meta.domain_left_edge.tolist(),
+            'domain_right_edge': self.meta.basic_meta.domain_right_edge.tolist(),
         }
+        
+        if self.is_time_series:
+            attrs['time_steps'] = len(self.plotfile_paths)
+            attrs['time_range'] = [float(self.meta.time_values[0]), 
+                                  float(self.meta.time_values[-1])]
+            attrs['source_files'] = [p.name for p in self.plotfile_paths]
+        else:
+            attrs['plotfile'] = str(self.plotfile_paths[0])
+            attrs['time'] = float(self.meta.basic_meta.current_time)
+        
+        # Add xgcm grid topology
+        attrs['xgcm-Grid'] = self._create_xgcm_grid_spec()
+        
+        return attrs
+    
+    def _create_xgcm_grid_spec(self) -> Dict:
+        """Create xgcm grid specification."""
+        grid_spec = {}
+        
+        # X-axis
+        if any('u' == g['grid_type'] for g in self.meta.all_grids.values()):
+            grid_spec['X'] = {
+                'center': 'x_rho',
+                'left': 'x_u',
+            }
+            if any('psi' == g['grid_type'] for g in self.meta.all_grids.values()):
+                grid_spec['X']['outer'] = 'x_psi'
+        
+        # Y-axis
+        if any('v' == g['grid_type'] for g in self.meta.all_grids.values()):
+            grid_spec['Y'] = {
+                'center': 'y_rho',
+                'left': 'y_v',
+            }
+            if any('psi' == g['grid_type'] for g in self.meta.all_grids.values()):
+                grid_spec['Y']['outer'] = 'y_psi'
+        
+        # Z-axis (if 3D)
+        if self.meta.basic_meta.dimensionality == 3:
+            if any('w' == g['grid_type'] for g in self.meta.all_grids.values()):
+                grid_spec['Z'] = {
+                    'center': 'z_rho',
+                    'outer': 'z_w',
+                }
+        
+        return grid_spec
 
-class AMReXEntrypoint(BackendEntrypoint):
+
+class AMReXCGridEntrypoint(BackendEntrypoint):
     """
-    Unified AMReX backend entrypoint supporting both single and multiple files.
+    Xarray backend entrypoint for C-grid AMReX plotfiles.
     """
     
     def open_dataset(
         self,
-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore | list,
+        filename_or_obj: str | os.PathLike | List,
         *,
         drop_variables: str | Iterable[str] | None = None,
         level: int = 0,
-        time_dimension_name: str = None,
-        dimension_names: dict = None,
-        pattern: str = "plt_*",
         **kwargs
-    ):
+    ) -> xr.Dataset:
         """
-        Open AMReX plotfile(s) for a single level.
+        Open AMReX plotfile(s) as xarray Dataset.
         
         Parameters
         ----------
-        filename_or_obj : str, Path, list of str/Path, or directory path
-            - Single plotfile directory: loads one time step
-            - List of plotfile directories: concatenates along time dimension  
-            - Directory containing plotfiles: auto-discovers and concatenates time series
-        drop_variables : str or iterable of str, optional
-            Variable names to exclude from the dataset
+        filename_or_obj : str, Path, or list
+            Single plotfile directory or list of plotfile directories
+        drop_variables : str or iterable, optional
+            Variables to exclude
         level : int, default 0
-            AMR level to load (0 = base level)
-        time_dimension_name : str, optional
-            Name for the time dimension (default: 'ocean_time')
-        dimension_names : dict, optional
-            Custom dimension names, e.g., {'x': 'longitude', 'y': 'latitude', 'z': 'depth'}
-        pattern : str, default "plt_*"
-            Glob pattern to match plotfiles when input is a directory containing time series
+            AMR level to load
         **kwargs
-            Additional arguments (ignored for compatibility)
+            Additional arguments (for compatibility)
             
         Returns
         -------
-        xarray.Dataset
-            Dataset containing AMR level data with lazy dask arrays
+        xr.Dataset
+            Dataset with C-grid variables
         """
-        
-        # Normalize input to list of plotfile paths
-        plotfile_paths = self._resolve_input_to_plotfiles(filename_or_obj, pattern)
-        
-        # Single file case - use existing single-level logic
-        if len(plotfile_paths) == 1:
-            store = AMReXSingleLevelStore(
-                plotfile_paths[0], 
-                level=level, 
-                time_dimension_name=time_dimension_name,
-                dimension_names=dimension_names
-            )
-            
-            # Get variables, dimensions, and attributes
-            variables = store.get_variables()
-            attributes = store.get_attrs()
-            
+        # Normalize input to list
+        if isinstance(filename_or_obj, (list, tuple)):
+            plotfile_paths = [Path(p) for p in filename_or_obj]
         else:
-            # Multiple files case - use multi-time logic
-            store = AMReXMultiTimeStore(
-                plotfile_paths,
-                level=level,
-                time_dimension_name=time_dimension_name,
-                dimension_names=dimension_names
-            )
-            
-            # Get variables, dimensions, and attributes
-            variables = store.get_variables()
-            attributes = store.get_attrs()
+            plotfile_paths = [Path(filename_or_obj)]
         
-        # Filter out dropped variables
+        # Create store
+        store = AMReXCGridStore(plotfile_paths, level=level)
+        
+        # Get variables and attributes
+        variables = store.get_variables()
+        attributes = store.get_attrs()
+        
+        # Filter dropped variables
         if drop_variables:
             if isinstance(drop_variables, str):
                 drop_variables = [drop_variables]
             for var in drop_variables:
                 variables.pop(var, None)
         
-        # Create coordinate dict (separate from data variables)
+        # Separate coordinates from data variables
+        coord_names = {'ocean_time', 'x_rho', 'y_rho', 'z_rho', 'z_w',
+                      'x_u', 'y_u', 'x_v', 'y_v', 'x_psi', 'y_psi'}
+        
         coords = {}
         data_vars = {}
         
-        ### RDH -- this needs a refactor for generalization. Works for current REMORA plot files.
-        # Get the time dimension name
-        time_dim_name = time_dimension_name or 'ocean_time'
-        
         for name, var in variables.items():
-            if name in ['x', 'y', 'z', time_dim_name]:
+            if name in coord_names:
                 coords[name] = var
             else:
                 data_vars[name] = var
-        #### /RDH
-
+        
         # Create dataset
         return xr.Dataset(
             data_vars=data_vars,
@@ -606,129 +408,25 @@ class AMReXEntrypoint(BackendEntrypoint):
             attrs=attributes
         )
     
-    def _resolve_input_to_plotfiles(self, filename_or_obj, pattern: str = "plt_*") -> list:
-        """
-        Resolve various input types to a list of plotfile paths.
-        
-        Parameters
-        ----------
-        filename_or_obj : str, Path, list, or other
-            Input that could be:
-            - Single plotfile directory
-            - List of plotfile directories  
-            - Directory containing plotfiles
-            - Other xarray input types
-        pattern : str
-            Glob pattern for finding plotfiles in directories
-            
-        Returns
-        -------
-        list of Path
-            List of plotfile directory paths
-        """
-        # Handle list/tuple input
-        if isinstance(filename_or_obj, (list, tuple)):
-            return [Path(p) for p in filename_or_obj]
-        
-        # Handle non-path inputs (ReadBuffer, AbstractDataStore, etc.)
-        if not isinstance(filename_or_obj, (str, os.PathLike)):
-            return [filename_or_obj]
-        
-        # Convert to Path
-        path = Path(filename_or_obj)
-        
-        # If path doesn't exist, return as-is (might be handled elsewhere)
-        if not path.exists():
-            return [path]
-        
-        # If it's a file, return as-is
-        if path.is_file():
-            return [path]
-        
-        # If it's a directory, we need to determine if it's:
-        # 1. A single plotfile directory
-        # 2. A directory containing multiple plotfiles
-        
-        if self._is_amrex_plotfile_directory(path):
-            # It's a single plotfile directory
-            return [path]
-        else:
-            # It's a directory containing plotfiles - find them using pattern
-            plotfiles = list(path.glob(pattern))
-            # Filter to only directories that look like plotfiles
-            plotfiles = [p for p in plotfiles if p.is_dir() and self._is_amrex_plotfile_directory(p)]
-            
-            if not plotfiles:
-                # No plotfiles found with pattern, maybe the directory itself is a plotfile
-                # or the pattern didn't match - try to treat as single plotfile
-                return [path]
-            
-            # Sort plotfiles by simulation time
-            return self._sort_plotfiles_by_time(plotfiles)
-    
-    def _is_amrex_plotfile_directory(self, path: Path) -> bool:
-        """Check if a directory looks like an AMReX plotfile."""
-        try:
-            if not path.is_dir():
-                return False
-            
-            # Check for AMReX plotfile structure
-            header_file = path / 'Header'
-            level_0_dir = path / 'Level_0'
-            
-            if not (header_file.exists() and level_0_dir.is_dir()):
-                return False
-            
-            # Check for Cell_H file in Level_0
-            cell_h_file = level_0_dir / 'Cell_H'
-            return cell_h_file.exists()
-            
-        except Exception:
-            return False
-    
-    def _sort_plotfiles_by_time(self, plotfiles: list) -> list:
-        """Sort plotfiles by simulation time."""
-        try:
-            time_file_pairs = []
-            
-            for pf in plotfiles:
-                try:
-                    meta = AMReXDatasetMeta(pf)
-                    time_file_pairs.append((meta.current_time, pf))
-                except Exception:
-                    # If we can't read the time, use filename for sorting
-                    time_file_pairs.append((float('inf'), pf))
-            
-            # Sort by time
-            time_file_pairs.sort(key=lambda x: x[0])
-            return [pair[1] for pair in time_file_pairs]
-            
-        except Exception:
-            # Fallback to filename sorting
-            return sorted(plotfiles)
-    
-    def guess_can_open(self, filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore) -> bool:
+    def guess_can_open(self, filename_or_obj) -> bool:
         """Check if this looks like an AMReX plotfile."""
         try:
-            path = Path(filename_or_obj)
+            if isinstance(filename_or_obj, (list, tuple)):
+                path = Path(filename_or_obj[0])
+            else:
+                path = Path(filename_or_obj)
+            
             if not path.is_dir():
                 return False
             
-            # Check for AMReX plotfile structure
-            header_file = path / 'Header'
-            level_0_dir = path / 'Level_0'
+            # Check for AMReX structure
+            header = path / 'Header'
+            level_0 = path / 'Level_0'
             
-            if not (header_file.exists() and level_0_dir.is_dir()):
-                return False
-            
-            # Check for Cell_H file in Level_0
-            cell_h_file = level_0_dir / 'Cell_H'
-            return cell_h_file.exists()
-            
+            return header.exists() and level_0.is_dir()
         except Exception:
             return False
-
-    open_dataset_parameters = ["filename_or_obj", "drop_variables", "level"]
     
-    description = "Single-level AMReX plotfile backend with lazy dask loading"
-    url = "https://github.com/your-repo/xamrex"
+    open_dataset_parameters = ["filename_or_obj", "drop_variables", "level"]
+    description = "C-grid AMReX plotfile backend with automatic grid detection"
+    url = "https://github.com/hetland/xamrex"
