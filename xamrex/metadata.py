@@ -354,6 +354,9 @@ class AMReXMultiGridMeta:
         # Discover all grids across all files and levels
         self.all_grids = self._discover_all_grids()
         
+        # Discover per-level grid information for consistent loading
+        self.level_grids = self._discover_per_level_grids()
+        
         # Map variables to grids
         self.variable_to_grid = self._map_variables_to_grids()
         
@@ -461,6 +464,35 @@ class AMReXMultiGridMeta:
         
         return all_grids
     
+    def _discover_per_level_grids(self) -> Dict[int, Dict[str, Dict]]:
+        """
+        Discover grid information for each level independently.
+        
+        This provides per-level dimensions and num_components for consistent
+        array shapes across time series, even when levels are missing in some files.
+        
+        Returns
+        -------
+        dict
+            {level: {directory_name: grid_info_dict}}
+        """
+        level_grids = {}
+        
+        # For each level that appears anywhere
+        for level in self.level_availability.keys():
+            # Use first file where this level appears
+            file_idx = self.level_availability[level][0]
+            pf_path = self.plotfile_paths[file_idx]
+            
+            try:
+                grids = self.detector.detect_grids(pf_path, level)
+                level_grids[level] = grids
+            except Exception as e:
+                print(f"Warning: Failed to discover level {level} grids in {pf_path}: {e}")
+                level_grids[level] = {}
+        
+        return level_grids
+    
     def _map_variables_to_grids(self) -> Dict[str, str]:
         """
         Map variable names to grid directory names.
@@ -489,6 +521,27 @@ class AMReXMultiGridMeta:
     def get_grid_info(self, directory_name: str) -> Dict:
         """Get grid information for a specific directory."""
         return self.all_grids.get(directory_name, {})
+    
+    def get_level_grid_info(self, level: int, directory_name: str) -> Dict:
+        """
+        Get grid information for a specific level and directory.
+        
+        Parameters
+        ----------
+        level : int
+            AMR level
+        directory_name : str
+            Grid directory name (e.g., 'Cell', 'UFace')
+            
+        Returns
+        -------
+        dict
+            Grid info dict with dimensions, num_components, etc.
+            Returns empty dict if level or directory not found.
+        """
+        if level not in self.level_grids:
+            return {}
+        return self.level_grids[level].get(directory_name, {})
     
     def get_variable_grid(self, variable_name: str) -> str:
         """Get the grid directory name for a variable."""
