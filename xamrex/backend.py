@@ -113,9 +113,20 @@ class AMReXCGridStore(AbstractDataStore):
         
         # Generate horizontal coordinates for each discovered grid type
         # Use level-specific dimensions, not cached dimensions from all_grids
+        # Find a plotfile that has this level
         from .grid_detector import GridDetector
         detector = GridDetector()
-        level_grids = detector.detect_grids(self.plotfile_paths[0], self.level)
+        
+        # Find first file where this level exists
+        plotfile_with_level = None
+        for file_idx in self.meta.level_availability.get(self.level, []):
+            plotfile_with_level = self.plotfile_paths[file_idx]
+            break
+        
+        if plotfile_with_level is None:
+            plotfile_with_level = self.plotfile_paths[0]
+        
+        level_grids = detector.detect_grids(plotfile_with_level, self.level)
         
         coords_created = set()
         for dir_name, grid_info in level_grids.items():
@@ -200,22 +211,20 @@ class AMReXCGridStore(AbstractDataStore):
         # Get the component index for this variable within its grid
         var_index = self.meta.basic_meta.variable_to_component_index.get(var_name, 0)
         
-        # Get dimensions for the REQUESTED level, not from cached grid_info
-        # grid_info['dimensions'] may be from a different level!
-        # Instead, we need to detect the grid at the current level
+        # Use pre-computed per-level grid information from metadata
+        # This was determined upfront by querying all files
         is_2d = grid_info['dimensionality'] == 2
         
-        # Get dimensions by actually reading the grid at this level
-        # We'll use the first plotfile to determine dimensions
-        from .grid_detector import GridDetector
-        detector = GridDetector()
-        level_grids = detector.detect_grids(self.plotfile_paths[0], self.level)
+        # Get level-specific grid info (dimensions and num_components for this level)
+        level_grid_info = self.meta.get_level_grid_info(self.level, dir_name)
         
-        if dir_name in level_grids:
-            dimensions = level_grids[dir_name]['dimensions']
+        if level_grid_info:
+            dimensions = level_grid_info['dimensions']
+            num_components = level_grid_info['num_components']
         else:
-            # Fallback to grid_info dimensions (shouldn't happen)
+            # Fallback to cached grid_info (shouldn't happen if level exists)
             dimensions = grid_info['dimensions']
+            num_components = grid_info['num_components']
         
         # Use dimensions as-is from grid detector
         # No stagger adjustments needed - they're already included!
@@ -238,12 +247,18 @@ class AMReXCGridStore(AbstractDataStore):
                     try:
                         fab_meta = FABMetadata(
                             pf_path, self.level, dir_name,
-                            grid_info['num_components'],
+                            num_components,
                             grid_info['dimensionality']
                         )
+                        # Calculate refinement ratio for this level
+                        if self.meta.basic_meta.ref_factors is not None and self.level > 0:
+                            ref_ratio = int(self.meta.basic_meta.ref_factors[0]) ** self.level
+                        else:
+                            ref_ratio = 1
+                        
                         loader = FABLoader(
                             pf_path, self.level, dir_name,
-                            var_index, fab_meta, full_shape
+                            var_index, fab_meta, full_shape, ref_ratio
                         )
                         time_arrays.append(loader.create_dask_array())
                     except Exception as e:
@@ -265,12 +280,18 @@ class AMReXCGridStore(AbstractDataStore):
             try:
                 fab_meta = FABMetadata(
                     self.plotfile_paths[0], self.level, dir_name,
-                    grid_info['num_components'],
+                    num_components,
                     grid_info['dimensionality']
                 )
+                # Calculate refinement ratio for this level
+                if self.meta.basic_meta.ref_factors is not None and self.level > 0:
+                    ref_ratio = int(self.meta.basic_meta.ref_factors[0]) ** self.level
+                else:
+                    ref_ratio = 1
+                
                 loader = FABLoader(
                     self.plotfile_paths[0], self.level, dir_name,
-                    var_index, fab_meta, full_shape
+                    var_index, fab_meta, full_shape, ref_ratio
                 )
                 return loader.create_dask_array()
             except Exception as e:

@@ -95,9 +95,9 @@ class CGridCoordinateGenerator:
     
     def _generate_x_coordinate(self, nx: int, grid_type: str) -> np.ndarray:
         """
-        Generate x-coordinate with appropriate staggering and refinement.
+        Generate x-coordinate with appropriate staggering.
         
-        For refined levels, coordinates are calculated based on the refined cell size.
+        Coordinates are based on domain extent and number of rho-cells at this level.
         
         Parameters
         ----------
@@ -114,31 +114,28 @@ class CGridCoordinateGenerator:
         x_min = self.domain_left[0]
         x_max = self.domain_right[0]
         
-        # Get Level 0 dimension for calculating base cell size
-        nx_level0 = self.level_dimensions[0][0]
+        # Get number of rho-cells at current level
+        nx_rho = self.level_dimensions[self.level][0]
         
-        # Base cell size at Level 0
-        dx_base = (x_max - x_min) / nx_level0
-        
-        # Refined cell size at current level
-        dx_refined = dx_base / self.ref_ratio
+        # Cell size based on domain extent and rho-cells
+        dx = (x_max - x_min) / nx_rho
         
         if grid_type in ['u', 'psi']:
             # Face/corner points - coordinates at cell faces
-            # For refined levels, coordinates start from domain_left and use refined cell size
-            x = x_min + np.arange(nx) * dx_refined
+            # nx = nx_rho + 1 for faces
+            x = x_min + np.arange(nx) * dx
         else:
             # Cell centers (rho, v, w)
-            # Coordinates at cell centers with refined spacing
-            x = x_min + (np.arange(nx) + 0.5) * dx_refined
+            # nx = nx_rho for cell centers
+            x = x_min + (np.arange(nx) + 0.5) * dx
         
         return x
     
     def _generate_y_coordinate(self, ny: int, grid_type: str) -> np.ndarray:
         """
-        Generate y-coordinate with appropriate staggering and refinement.
+        Generate y-coordinate with appropriate staggering.
         
-        For refined levels, coordinates are calculated based on the refined cell size.
+        Coordinates are based on domain extent and number of rho-cells at this level.
         
         Parameters
         ----------
@@ -155,23 +152,20 @@ class CGridCoordinateGenerator:
         y_min = self.domain_left[1]
         y_max = self.domain_right[1]
         
-        # Get Level 0 dimension for calculating base cell size
-        ny_level0 = self.level_dimensions[0][1]
+        # Get number of rho-cells at current level
+        ny_rho = self.level_dimensions[self.level][1]
         
-        # Base cell size at Level 0
-        dy_base = (y_max - y_min) / ny_level0
-        
-        # Refined cell size at current level
-        dy_refined = dy_base / self.ref_ratio
+        # Cell size based on domain extent and rho-cells
+        dy = (y_max - y_min) / ny_rho
         
         if grid_type in ['v', 'psi']:
             # Face/corner points - coordinates at cell faces
-            # For refined levels, coordinates start from domain_left and use refined cell size
-            y = y_min + np.arange(ny) * dy_refined
+            # ny = ny_rho + 1 for faces
+            y = y_min + np.arange(ny) * dy
         else:
             # Cell centers (rho, u, w)
-            # Coordinates at cell centers with refined spacing
-            y = y_min + (np.arange(ny) + 0.5) * dy_refined
+            # ny = ny_rho for cell centers
+            y = y_min + (np.arange(ny) + 0.5) * dy
         
         return y
     

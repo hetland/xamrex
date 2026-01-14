@@ -109,12 +109,9 @@ class FABMetadata:
             fab_byte_offset = np.zeros(self.nfabs, dtype=int)
             
             for fabnum in range(self.nfabs):
-                # Read the FabOnDisk line
+                # Read lines until we find FabOnDisk
                 line = f.readline().strip()
-                
-                # Parse format: "FabOnDisk: filename offset" or "1\nFabOnDisk: filename offset"
-                if not line.startswith('FabOnDisk:'):
-                    # May need to read another line
+                while line and not line.startswith('FabOnDisk:'):
                     line = f.readline().strip()
                 
                 if line.startswith('FabOnDisk:'):
@@ -122,15 +119,7 @@ class FABMetadata:
                     fab_filename[fabnum] = parts[1]
                     fab_byte_offset[fabnum] = int(parts[2])
                 else:
-                    raise ValueError(f"Expected 'FabOnDisk:' line, got: {line}")
-                
-                # Skip additional metadata lines (blank, dim info, values, blank)
-                # These appear to be min/max or other statistics
-                f.readline()  # blank line
-                dim_line = f.readline().strip()  # e.g., "1,5"
-                if dim_line:  # If there's dimension info
-                    f.readline()  # value line
-                    f.readline()  # blank line
+                    raise ValueError(f"Expected 'FabOnDisk:' line after {fabnum} FABs")
         
         # Build metadata DataFrame
         df_cols = ['lo_i', 'lo_j', 'lo_k', 'hi_i', 'hi_j', 'hi_k', 
@@ -163,7 +152,7 @@ class FABLoader:
     
     def __init__(self, plotfile_path: Path, level: int, directory_name: str,
                  variable_index: int, fab_metadata: FABMetadata, 
-                 full_shape: Tuple[int, ...]):
+                 full_shape: Tuple[int, ...], refinement_ratio: int = 1):
         """
         Initialize FAB loader for a specific variable.
         
@@ -181,6 +170,8 @@ class FABLoader:
             FAB metadata object
         full_shape : tuple
             Full array shape including time dimension
+        refinement_ratio : int, default 1
+            Cumulative refinement ratio for this level (e.g., 3 for level 1 with 3x refinement)
         """
         self.plotfile_path = Path(plotfile_path)
         self.level = level
@@ -188,6 +179,7 @@ class FABLoader:
         self.variable_index = variable_index
         self.fab_metadata = fab_metadata
         self.full_shape = full_shape
+        self.refinement_ratio = refinement_ratio
         self.dtype = np.float64
     
     def create_dask_array(self) -> da.Array:
@@ -208,10 +200,14 @@ class FABLoader:
         for fab_idx in range(self.fab_metadata.nfabs):
             fab_data = self._read_fab_data(fab_idx)
             
-            # Get index ranges
+            # Get index ranges from FAB metadata
             fab_row = self.fab_metadata.metadata.iloc[fab_idx]
             lo_i, lo_j, lo_k = fab_row['lo_i'], fab_row['lo_j'], fab_row['lo_k']
             hi_i, hi_j, hi_k = fab_row['hi_i'], fab_row['hi_j'], fab_row['hi_k']
+            
+            # For Level 0, use indices directly
+            # For refined levels, indices in header are relative to current level's grid
+            # No scaling needed - just place data directly
             
             # Place data in correct location
             if self.fab_metadata.dimensionality == 3:
@@ -222,6 +218,33 @@ class FABLoader:
                 full_data[0, lo_j:hi_j, lo_i:hi_i] = fab_data
         
         return full_data
+    
+    def _upsample_data(self, data: np.ndarray, ratio: int) -> np.ndarray:
+        """
+        Upsample data by repeating values (nearest neighbor interpolation).
+        
+        Parameters
+        ----------
+        data : ndarray
+            Input data, shape (nz, ny, nx) for 3D or (ny, nx) for 2D
+        ratio : int
+            Upsampling ratio
+            
+        Returns
+        -------
+        ndarray
+            Upsampled data
+        """
+        if self.fab_metadata.dimensionality == 3:
+            # 3D: upsample in x and y, not z
+            nz, ny, nx = data.shape
+            upsampled = np.repeat(np.repeat(data, ratio, axis=2), ratio, axis=1)
+            return upsampled
+        else:
+            # 2D: upsample in x and y
+            ny, nx = data.shape
+            upsampled = np.repeat(np.repeat(data, ratio, axis=1), ratio, axis=0)
+            return upsampled
     
     def _read_fab_data(self, fab_idx: int) -> np.ndarray:
         """Read data for a specific FAB."""

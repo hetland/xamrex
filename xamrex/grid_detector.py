@@ -4,6 +4,7 @@ Automatic grid type detection from AMReX plotfile directory structure.
 from pathlib import Path
 from typing import Dict, List, Tuple
 import re
+import numpy as np
 
 
 class GridDetector:
@@ -60,6 +61,9 @@ class GridDetector:
         if not level_dir.exists():
             raise ValueError(f"Level directory not found: {level_dir}")
         
+        # Get domain dimensions and refinement from main Header
+        level_dimensions, ref_factors = self._get_domain_info(plotfile_path)
+        
         discovered_grids = {}
         
         # Find all *_H header files
@@ -70,7 +74,7 @@ class GridDetector:
                 dir_name = dir_name[:-2]
             
             try:
-                grid_info = self._parse_grid_header(header_file)
+                grid_info = self._parse_grid_header(header_file, level, level_dimensions, ref_factors)
                 grid_info['grid_type'] = self._infer_grid_type(dir_name)
                 grid_info['directory_name'] = dir_name
                 discovered_grids[dir_name] = grid_info
@@ -80,7 +84,26 @@ class GridDetector:
         
         return discovered_grids
     
-    def _parse_grid_header(self, header_file: Path) -> Dict:
+    def _get_domain_info(self, plotfile_path: Path) -> tuple:
+        """
+        Extract domain dimensions and refinement factors from main Header.
+        
+        Parameters
+        ----------
+        plotfile_path : Path
+            Path to plotfile directory
+            
+        Returns
+        -------
+        tuple
+            (level_dimensions dict, refinement_factors array)
+        """
+        from .metadata import AMReXBasicMeta
+        meta = AMReXBasicMeta(plotfile_path)
+        return meta.level_dimensions, meta.ref_factors
+    
+    def _parse_grid_header(self, header_file: Path, level: int, 
+                          level_dimensions: Dict, ref_factors: np.ndarray) -> Dict:
         """
         Parse a *_H header file to extract grid information.
         
@@ -88,6 +111,12 @@ class GridDetector:
         ----------
         header_file : Path
             Path to the header file (e.g., Cell_H, UFace_H)
+        level : int
+            AMR level being parsed
+        level_dimensions : dict
+            Full domain dimensions for all levels
+        ref_factors : array
+            Refinement factors
             
         Returns
         -------
@@ -142,8 +171,13 @@ class GridDetector:
             else:
                 raise ValueError(f"Unexpected format for nfabs line: {nfabs_line}")
             
-            # Parse FAB index ranges to determine dimensions
-            dimensions = self._parse_fab_dimensions(f, nfabs)
+            # Parse FAB index ranges to get staggering info
+            stagger = self._parse_fab_stagger(f, nfabs)
+        
+        # Calculate full-domain dimensions for this level based on domain size and staggering
+        dimensions = self._calculate_full_domain_dimensions(
+            level, level_dimensions, stagger
+        )
         
         # Determine dimensionality from dimensions
         dimensionality = sum(1 for d in dimensions if d > 1)
@@ -153,15 +187,20 @@ class GridDetector:
             'num_fabs': nfabs,
             'dimensions': dimensions,
             'dimensionality': dimensionality,
+            'stagger': stagger,
             'variables': [],  # Will be filled from main Header
         }
     
-    def _parse_fab_dimensions(self, f, nfabs: int) -> Tuple:
+    def _parse_fab_stagger(self, f, nfabs: int) -> Tuple[int, int, int]:
         """
-        Parse FAB index ranges to determine overall grid dimensions.
+        Parse FAB index ranges to extract stagger information.
         
-        Parses the stagger tuple to get actual dimensions including staggering,
-        and filters out zero-length dimensions for 2D variables.
+        The stagger tuple tells us how this grid is staggered relative to cell centers:
+        (0,0,0) = cell centers (rho-points)
+        (1,0,0) = x-face centers (u-points)
+        (0,1,0) = y-face centers (v-points)
+        (0,0,1) = z-face centers (w-points)
+        (1,1,0) = xy-corners (psi-points)
         
         Parameters
         ----------
@@ -173,39 +212,78 @@ class GridDetector:
         Returns
         -------
         tuple
-            Dimensions (nx, ny) for 2D or (nx, ny, nz) for 3D,
-            with staggering already applied and zero-length dims removed
+            (stagger_x, stagger_y, stagger_z)
         """
         # Regex for parsing FAB indices
-        _1dregx = r"-?\d+"
-        _2dregx = r"-?\d+,-?\d+"
         _3dregx = r"-?\d+,-?\d+,-?\d+"
         
         # Parse format: ((lo_x,lo_y,lo_z) (hi_x,hi_y,hi_z) (stagger_x,stagger_y,stagger_z))
         dim_finder = re.compile(rf"\(\(({_3dregx})\) \(({_3dregx})\) \(({_3dregx})\)\)$")
         
-        max_indices = [-1, -1, -1]
-        stagger = [0, 0, 0]  # Will be same for all FABs in a grid
+        stagger = None
         
         for _ in range(nfabs):
             line = f.readline().strip()
             match = dim_finder.match(line)
             if match:
-                lo_str, hi_str, stagger_str = match.groups()
-                hi_indices = [int(x) for x in hi_str.split(',')]
-                stagger_values = [int(x) for x in stagger_str.split(',')]
+                _, _, stagger_str = match.groups()
+                stagger_values = tuple(int(x) for x in stagger_str.split(','))
                 
-                for i in range(3):
-                    max_indices[i] = max(max_indices[i], hi_indices[i])
-                    stagger[i] = stagger_values[i]  # Should be same for all FABs
+                if stagger is None:
+                    stagger = stagger_values
+                # Verify all FABs have same stagger (should be true)
+                elif stagger != stagger_values:
+                    print(f"Warning: Inconsistent stagger values in FABs: {stagger} vs {stagger_values}")
         
-        # Convert from max index to dimension count
-        # Dimensions already include staggering from the high index
-        all_dims = [idx + 1 for idx in max_indices]
+        return stagger if stagger else (0, 0, 0)
+    
+    def _calculate_full_domain_dimensions(self, level: int, level_dimensions: Dict,
+                                         stagger: Tuple[int, int, int]) -> Tuple:
+        """
+        Calculate full-domain dimensions for a grid at a specific level.
         
-        # Filter out zero-length dimensions (for 2D variables)
-        # If a dimension is 1 (from high index = 0), it's a zero-length dimension
-        dimensions = tuple(d for d in all_dims if d > 1)
+        For cell-centered grids (stagger=0,0,0):
+            Use level_dimensions directly
+        
+        For staggered grids:
+            - u-points (stagger=1,0,0): nx+1 in x-direction
+            - v-points (stagger=0,1,0): ny+1 in y-direction  
+            - w-points (stagger=0,0,1): nz+1 in z-direction
+            - psi-points (stagger=1,1,0): nx+1, ny+1
+        
+        Parameters
+        ----------
+        level : int
+            AMR level
+        level_dimensions : dict
+            Full domain dimensions for all levels {level: [nx, ny, nz]}
+        stagger : tuple
+            (stagger_x, stagger_y, stagger_z)
+            
+        Returns
+        -------
+        tuple
+            Full domain dimensions (nx, ny) for 2D or (nx, ny, nz) for 3D
+        """
+        if level not in level_dimensions:
+            raise ValueError(f"Level {level} not found in level_dimensions")
+        
+        base_dims = level_dimensions[level]
+        
+        # Apply staggering
+        nx = base_dims[0] + stagger[0]
+        ny = base_dims[1] + stagger[1]
+        
+        if len(base_dims) > 2:
+            # 3D
+            nz = base_dims[2] + stagger[2]
+            full_dims = (nx, ny, nz)
+        else:
+            # 2D
+            full_dims = (nx, ny)
+        
+        # Filter out zero-length dimensions (though this shouldn't happen with this approach)
+        dimensions = tuple(d for d in full_dims if d > 1)
         
         return dimensions
     
