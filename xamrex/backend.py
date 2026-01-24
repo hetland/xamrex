@@ -66,12 +66,56 @@ class AMReXCGridStore(AbstractDataStore):
             level=level
         )
         
-        # Check if requested level ever exists
+        # Check if requested level ever exists (query across all plotfiles)
         if level not in self.meta.level_availability:
-            raise ValueError(
-                f"Level {level} never appears in provided plotfiles. "
-                f"Available levels: {list(self.meta.level_availability.keys())}"
+            # Build detailed error message showing level distribution
+            level_info = []
+            for lvl in sorted(self.meta.level_availability.keys()):
+                file_indices = self.meta.level_availability[lvl]
+                level_info.append(f"  Level {lvl}: present in {len(file_indices)}/{len(self.plotfile_paths)} files")
+            
+            error_msg = (
+                f"Level {level} does not exist in any of the provided plotfiles.\n"
+                f"Available levels across all {len(self.plotfile_paths)} plotfile(s):\n" +
+                "\n".join(level_info) +
+                f"\n\nMaximum available level: {self.meta.max_level_ever}"
             )
+            raise ValueError(error_msg)
+    
+    @property
+    def max_available_level(self) -> int:
+        """
+        Get the maximum AMR level available across all plotfiles.
+        
+        Returns
+        -------
+        int
+            Maximum level that exists in at least one plotfile
+        """
+        return self.meta.max_level_ever
+    
+    @property
+    def available_levels(self) -> List[int]:
+        """
+        Get list of all AMR levels available across the plotfiles.
+        
+        Returns
+        -------
+        list of int
+            Sorted list of levels that exist in at least one plotfile
+        """
+        return sorted(self.meta.level_availability.keys())
+    
+    def get_level_distribution(self) -> Dict[int, List[int]]:
+        """
+        Get detailed information about which levels exist in which files.
+        
+        Returns
+        -------
+        dict
+            {level: [file_indices where this level exists]}
+        """
+        return dict(self.meta.level_availability)
     
     def get_variables(self) -> Dict[str, Variable]:
         """Return all variables including coordinates and data variables."""
